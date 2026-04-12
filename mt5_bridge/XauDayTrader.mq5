@@ -524,6 +524,7 @@ double AccountDrawdownPct()
 //+------------------------------------------------------------------+
 bool HasPosition(int side)
 {
+   // Check filled positions
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetSymbol(i) != _Symbol) continue;
@@ -532,6 +533,18 @@ bool HasPosition(int side)
       long posType = PositionGetInteger(POSITION_TYPE);
       if(side > 0 && posType == POSITION_TYPE_BUY)  return true;
       if(side < 0 && posType == POSITION_TYPE_SELL) return true;
+   }
+   // Check pending limit/stop orders (BuyLimit, SellLimit, BuyStop, SellStop)
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+
+      long orderType = OrderGetInteger(ORDER_TYPE);
+      if(side > 0 && (orderType == ORDER_TYPE_BUY_LIMIT  || orderType == ORDER_TYPE_BUY_STOP))  return true;
+      if(side < 0 && (orderType == ORDER_TYPE_SELL_LIMIT || orderType == ORDER_TYPE_SELL_STOP)) return true;
    }
    return false;
 }

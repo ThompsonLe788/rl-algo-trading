@@ -20,7 +20,7 @@ from pathlib import Path
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import ZMQ_SIGNAL_ADDR, EOD_HOUR_GMT, LOG_DIR, LIVE_STATE_PATH
+from config import ZMQ_SIGNAL_ADDR, EOD_HOUR_GMT, LOG_DIR, LIVE_STATE_PATH, get_symbol_config
 from risk.kelly import KellyPositionSizer, vwap_slice_orders
 from risk.kill_switch import KillSwitch
 
@@ -239,6 +239,9 @@ class SignalServer:
 
         self.addr = addr
         self.kelly = KellyPositionSizer()
+        sym_cfg = get_symbol_config(self.symbol)
+        self._contract_size = sym_cfg["contract_size"]
+        self._atr_mult_sl   = sym_cfg["atr_mult_sl"]
         self.kill_switch = KillSwitch()
         self._signal_count = 0
         self.state_writer = LiveStateWriter()
@@ -308,7 +311,7 @@ class SignalServer:
         z_score: float,
         regime: int,
         account_equity: float,
-        atr_mult_sl: float = 1.5,
+        atr_mult_sl: float | None = None,
         current_position: int = 0,
         entry_price: float = 0.0,
     ) -> Signal | None:
@@ -318,6 +321,8 @@ class SignalServer:
             action: 0=hold, 1=long, 2=short, 3=close
             current_position/entry_price: for unrealized P&L in live state
         """
+        if atr_mult_sl is None:
+            atr_mult_sl = self._atr_mult_sl
         status = self.kill_switch.check(account_equity)
 
         # Update shared live state every call
@@ -367,6 +372,7 @@ class SignalServer:
             account_equity=account_equity,
             entry_price=mid_price,
             sl_distance=sl_dist,
+            contract_size=self._contract_size,
         )
 
         sig = Signal(

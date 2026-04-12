@@ -171,10 +171,17 @@ class SymbolWorker(threading.Thread):
                 self._set_status("error")
                 return
 
+            # Cached equity — returned when MT5 account_info() fails so
+            # KillSwitch never sees equity=0 (which triggers 100% drawdown).
+            _eq_cache: list[float] = [0.0]
+
             def account_info():
                 info = mt5.account_info()
-                if info is None:
-                    return 0.0, 0.0
+                if info is None or info.equity <= 0:
+                    # MT5 unavailable (market closed / weekend) — use cache
+                    cached = _eq_cache[0]
+                    return (cached, cached) if cached > 0 else (1.0, 1.0)
+                _eq_cache[0] = info.equity
                 return info.equity, info.balance
 
             tick_stream = _StoppableTickStream(

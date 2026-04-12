@@ -3,7 +3,6 @@
 Hard stop if account drawdown exceeds MAX_DRAWDOWN_PCT.
 Also enforces EOD liquidation and daily loss limits.
 """
-import time
 import logging
 from datetime import datetime, timezone
 
@@ -35,6 +34,7 @@ class KillSwitch:
         self.session_start_equity = 0.0
         self.is_killed = False
         self.kill_reason = ""
+        self._eod_logged_hour: int = -1   # throttle: log EOD once per hour
 
     def update_equity(self, current_equity: float):
         """Track peak equity for drawdown calculation."""
@@ -75,6 +75,17 @@ class KillSwitch:
                 "daily_loss_pct": float,
             }
         """
+        # Guard: invalid equity (MT5 unavailable / weekend) — don't compute
+        # drawdown, don't log, don't allow new trades but don't kill either.
+        if current_equity <= 0:
+            return {
+                "should_close_all": False,
+                "allow_new_trades": False,
+                "reason": "equity_unavailable",
+                "drawdown_pct": 0.0,
+                "daily_loss_pct": 0.0,
+            }
+
         self.update_equity(current_equity)
         dd = self.drawdown_pct(current_equity)
         daily_loss = self.daily_loss_pct_current(current_equity)
@@ -103,12 +114,15 @@ class KillSwitch:
             result["reason"] = f"DAILY LOSS {daily_loss:.1f}% >= {self.daily_loss_pct}%"
             logger.warning(result["reason"])
 
-        # EOD liquidation
+        # EOD liquidation — log at most once per UTC hour to avoid log spam
         elif self.is_eod():
             result["should_close_all"] = True
             result["allow_new_trades"] = False
             result["reason"] = f"EOD liquidation (>= {self.eod_hour}:00 GMT)"
-            logger.info(result["reason"])
+            now_h = datetime.now(timezone.utc).hour
+            if now_h != self._eod_logged_hour:
+                logger.info(result["reason"])
+                self._eod_logged_hour = now_h
 
         # No new trades window
         elif self.no_new_trades_allowed():

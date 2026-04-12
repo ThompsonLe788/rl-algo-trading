@@ -517,17 +517,27 @@ def run_live_loop(
             )
 
             if signal is not None:
-                server.publish(signal)
-                if signal.side != 0:
-                    current_position = signal.side
-                    entry_price = signal.price
-                else:
-                    # Position closed — record P&L for drift detection
-                    if current_position != 0 and perf_monitor is not None:
-                        closed_pnl = current_position * (mid_price - entry_price)
-                        perf_monitor.record_trade(closed_pnl)
-                    current_position = 0
-                    entry_price = 0.0
+                new_side = signal.side
+                # Only publish on genuine state change — suppress spam:
+                #   • CLOSE when already flat  → no-op
+                #   • LONG  when already LONG  → no-op
+                #   • SHORT when already SHORT → no-op
+                is_noop = (
+                    (new_side == 0 and current_position == 0) or
+                    (new_side != 0 and new_side == current_position)
+                )
+                if not is_noop:
+                    server.publish(signal)
+                    if new_side != 0:
+                        current_position = new_side
+                        entry_price = signal.price
+                    else:
+                        # Position closed — record P&L for drift detection
+                        if current_position != 0 and perf_monitor is not None:
+                            closed_pnl = current_position * (mid_price - entry_price)
+                            perf_monitor.record_trade(closed_pnl)
+                        current_position = 0
+                        entry_price = 0.0
 
             time.sleep(1)
 

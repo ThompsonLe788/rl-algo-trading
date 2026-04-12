@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.pytest_cache/
+.mypy_cache/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment & secrets
+.env
+.env.local
+
+# Data & model files (large binary blobs)
+data/*.parquet
+data/*.csv
+data/*.h5
+ai_models/checkpoints/
+
+# Logs & runtime state (contain live financial data)
+logs/*.log
+logs/*.json
+logs/*.tmp
+logs/tb/
+
+# MT5 compiled files
+*.ex4
+*.ex5
+
+# Temporary files
+*.tmp
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# External dependencies (install separately — see README)
+_deps/

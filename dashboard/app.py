@@ -15,7 +15,7 @@ import streamlit as st
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import EOD_HOUR_GMT, LIVE_STATE_PATH, MAX_HOLD_BARS
-from dashboard.state_reader import read_state, read_worker_status, tail_log
+from dashboard.state_reader import read_state, read_worker_status, read_active_charts, tail_log
 
 # ─── Page config (runs once, outside fragment) ────────────────────────────────
 st.set_page_config(
@@ -328,7 +328,11 @@ def _dashboard() -> None:
     # ── Read live state ───────────────────────────────────────────────────────
     state             = read_state()
     worker_status     = read_worker_status()
-    all_known_symbols = sorted(set(state.symbols) | set(worker_status))
+    active_charts     = read_active_charts()
+    # Tab symbols = currently open MT5 charts only (chart open → tab shown, closed → removed).
+    # Fall back to live_state + worker_status when ATS_Panel not attached yet.
+    tab_symbols       = sorted(active_charts) if active_charts else sorted(set(state.symbols) | set(worker_status))
+    all_known_symbols = sorted(set(state.symbols) | set(worker_status))  # System tab history
     now_utc           = datetime.now(timezone.utc)
     ts_str            = now_utc.strftime("%H:%M:%S")
 
@@ -364,7 +368,7 @@ def _dashboard() -> None:
     dd       = state.drawdown_pct
     dd_color = "#3fb950" if dd < 5 else ("#d29922" if dd < 10 else "#f85149")
 
-    active_count = sum(1 for s in all_known_symbols if worker_status.get(s) == "live")
+    active_count = sum(1 for s in tab_symbols if worker_status.get(s) == "live")
 
     if state.is_killed:
         badge_html = '<span class="badge badge-killed">⬛ KILLED</span>'
@@ -409,7 +413,7 @@ def _dashboard() -> None:
       </div>
       <div class="header-item">
         <span class="header-label">Active</span>
-        <span class="header-value">{active_count}/{len(all_known_symbols)}</span>
+        <span class="header-value">{active_count}/{len(tab_symbols)}</span>
       </div>
       <div class="header-item">
         <span class="header-label">EOD</span>
@@ -432,14 +436,14 @@ def _dashboard() -> None:
     }
     tab_labels = [
         sym + _STATUS_BADGE.get(worker_status.get(sym, ""), "")
-        for sym in all_known_symbols
+        for sym in tab_symbols
     ] + ["⚙ System"]
 
     tabs = st.tabs(tab_labels)
     all_log_lines = tail_log(120)
 
     # ── Per-symbol tabs ───────────────────────────────────────────────────────
-    for tab, sym in zip(tabs[: len(all_known_symbols)], all_known_symbols):
+    for tab, sym in zip(tabs[: len(tab_symbols)], tab_symbols):
         sym_state = state.symbols.get(sym)
         wstatus   = worker_status.get(sym, "")
 

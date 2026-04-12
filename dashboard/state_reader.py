@@ -116,6 +116,36 @@ def read_worker_status() -> dict[str, str]:
         return {}
 
 
+def read_active_charts(mt5_files_path: "Path | None" = None) -> set:
+    """Return set of symbols whose ats_chart_{SYMBOL}.txt contains '1'.
+
+    Mirrors scan_active_symbols() in multi_runner.py — same file format.
+    Returns empty set if MT5 Common Files directory is absent or unreadable.
+    """
+    if mt5_files_path is None:
+        from config import MT5_FILES_PATH
+        mt5_files_path = MT5_FILES_PATH
+    active: set = set()
+    try:
+        for f in mt5_files_path.glob("ats_chart_*.txt"):
+            try:
+                content = ""
+                for enc in ("utf-16", "utf-8", "latin-1"):
+                    try:
+                        content = f.read_text(encoding=enc).strip()
+                        break
+                    except (UnicodeDecodeError, UnicodeError):
+                        pass
+                if content == "1":
+                    sym = f.stem.replace("ats_chart_", "").upper()
+                    active.add(sym)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return active
+
+
 def tail_log(lines: int = 50) -> list[str]:
     """Return last `lines` lines of signal_server.log.
 

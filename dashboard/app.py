@@ -106,10 +106,11 @@ with st.sidebar:
 # Main — tabs per symbol + System tab
 # ---------------------------------------------------------------------------
 _STATUS_BADGE = {
-    "training": " ⏳",
-    "live":     " 🟢",
-    "waiting":  " ⚪",
-    "error":    " 🔴",
+    "training":   " ⏳",
+    "retraining": " 🔄",
+    "live":       " 🟢",
+    "waiting":    " ⚪",
+    "error":      " 🔴",
 }
 
 symbol_list = all_known_symbols
@@ -131,7 +132,7 @@ for tab, sym in zip(tabs[: len(symbol_list)], symbol_list):
     sym_state = state.symbols.get(sym)
     wstatus   = worker_status.get(sym, "")
     with tab:
-        # --- Training in progress ---
+        # --- Training in progress (first-time bootstrap) ---
         if wstatus == "training":
             st.warning(f"**{sym}** — Model is being trained automatically, please wait...")
             st.markdown(
@@ -143,6 +144,13 @@ for tab, sym in zip(tabs[: len(symbol_list)], symbol_list):
             if train_logs:
                 st.code("\n".join(train_logs), language=None)
             continue
+
+        # --- Auto-retraining in background (model search) ---
+        if wstatus == "retraining":
+            st.info(f"**{sym}** 🔄 — AutoRetrainer is searching for a better model in the background.\n\nLive trading continues with the current model uninterrupted.")
+            retrain_logs = [ln for ln in all_log_lines if sym in ln and any(k in ln.lower() for k in ("retrain", "sharpe", "candidate", "accepted", "rejected"))][-20:]
+            if retrain_logs:
+                st.code("\n".join(retrain_logs), language=None)
 
         if wstatus == "error":
             st.error(f"**{sym}** — Worker encountered an error. Check System tab log.")

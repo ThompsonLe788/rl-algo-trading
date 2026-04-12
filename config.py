@@ -131,3 +131,33 @@ TKAN_INPUT_DIM = 6
 TKAN_CHEBY_ORDER = 4
 TKAN_HIDDEN_DIM = 64
 TKAN_NUM_CLASSES = 2  # range, trend
+
+# --------------------------------------------------------------------------
+# Auto-Retrainer
+# --------------------------------------------------------------------------
+
+# Drift detection: trigger retrain when rolling win-rate drops below this
+DRIFT_WIN_RATE_THRESHOLD = 0.43     # < 43% wins in the rolling window
+
+# Minimum closed trades before drift detection evaluates (avoids noise)
+RETRAIN_MIN_TRADES = 30
+
+# How often AutoRetrainer checks drift / weekly schedule (seconds)
+RETRAIN_CHECK_INTERVAL = 3_600      # every 1 hour
+
+# Weekly scheduled retrain: ISO weekday (0 = Monday … 6 = Sunday)
+RETRAIN_WEEKLY_DAY = 0              # Monday
+
+# Accept new model only if new_sharpe >= current_sharpe × this ratio
+# 0.90 = new model allowed to be up to 10% worse than current (noise tolerance)
+RETRAIN_MODEL_ACCEPT_RATIO = 0.90
+
+# Bars used to evaluate old vs new model (out-of-sample comparison)
+RETRAIN_EVAL_BARS = 5_000
+
+# Bars fetched for each full retrain cycle (more data than bootstrap)
+RETRAIN_BARS = 50_000
+
+# PPO timesteps for scheduled/drift retrains (more thorough than bootstrap)
+RETRAIN_TIMESTEPS = 300_000
+

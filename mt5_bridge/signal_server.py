@@ -445,6 +445,7 @@ def run_live_loop(
     symbol: str = "XAUUSD",
     zmq_socket=None,
     zmq_lock=None,   # threading.Lock for thread-safe sends on shared socket
+    perf_monitor=None,  # PerformanceMonitor — records closed-trade P&L for drift detection
 ):
     """Main live trading loop.
 
@@ -521,6 +522,10 @@ def run_live_loop(
                     current_position = signal.side
                     entry_price = signal.price
                 else:
+                    # Position closed — record P&L for drift detection
+                    if current_position != 0 and perf_monitor is not None:
+                        closed_pnl = current_position * (mid_price - entry_price)
+                        perf_monitor.record_trade(closed_pnl)
                     current_position = 0
                     entry_price = 0.0
 

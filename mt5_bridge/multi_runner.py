@@ -144,6 +144,8 @@ class SymbolWorker(threading.Thread):
             from data.pipeline import LiveTickStream
             from ai_models.rl_agent import load_ppo
             from mt5_bridge.signal_server import run_live_loop
+            from mt5_bridge.auto_retrainer import AutoRetrainer, ModelRef
+            from risk.performance_monitor import PerformanceMonitor
 
             # Initialize MT5 once for both training and live (BUG-17)
             mt5_ok = mt5.initialize()
@@ -181,12 +183,25 @@ class SymbolWorker(threading.Thread):
                 stop_event=self._stop_event,
             )
 
+            # Wrap model for thread-safe hot-swap by AutoRetrainer
+            model_ref = ModelRef(model)
+            perf_monitor = PerformanceMonitor(symbol=self.symbol)
+            retrainer = AutoRetrainer(
+                symbol=self.symbol,
+                model_ref=model_ref,
+                perf_monitor=perf_monitor,
+                stop_event=self._stop_event,
+                set_status_fn=self._set_status,
+            )
+            retrainer.start()
+
             self._set_status("live")
             run_live_loop(
-                model, None, tick_stream, account_info,
+                model_ref, None, tick_stream, account_info,
                 symbol=self.symbol,
                 zmq_socket=self.__class__._get_shared_socket(),
                 zmq_lock=self.__class__._zmq_send_lock,
+                perf_monitor=perf_monitor,
             )
             mt5.shutdown()
 

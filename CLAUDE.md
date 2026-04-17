@@ -206,12 +206,13 @@ bash sync_mt5.sh   # copy project → MT5 Experts/ & Indicators/
 
 ## Bugs đã fix (lịch sử — không lặp lại)
 
-### Python → EA signal bugs
+### Python → EA signal bugs (HOLD/CLOSE đóng position)
 ```
-BUG:  _send() gửi cả "HOLD" action xuống EA.
-      _side_map["HOLD"] = 0 = _side_map["CLOSE"] → EA gọi CloseAll() mỗi tick PPO output HOLD
-      → position vừa fill xong bị đóng ngay lập tức.
-FIX:  _send() return sớm nếu action == "HOLD". Chỉ gửi LONG / SHORT / CLOSE.
+BUG:  _send() gửi cả "HOLD" và "CLOSE" action xuống EA.
+      _side_map["HOLD"] = _side_map["CLOSE"] = 0 → EA gọi CloseAll()/ClosePositionsOnly()
+      mỗi tick PPO output HOLD hoặc CLOSE → position vừa fill bị đóng ngay lập tức.
+FIX:  _send() return sớm nếu action in ("HOLD", "CLOSE").
+      Python CHỈ gửi LONG / SHORT. EA quản lý toàn bộ exit (SL/TP/trail/EOD).
       File: mt5_bridge/runner.py  hàm _send()
 ```
 
@@ -233,13 +234,23 @@ FIX:  UpdateTrailingStops() chỉ trail positions đã đăng ký trong g_trails
       File: mt5_bridge/XauDayTrader.mq5  hàm UpdateTrailingStops() + CheckPartialTP()
 ```
 
-### EA CLOSE signal huỷ pending limit orders
+### EA signal mới đóng filled positions (sai nguyên tắc)
 ```
-BUG:  sig.side == 0 → CloseAll() → cancel cả BuyLimit/SellLimit chưa fill.
-      PPO output action=3 (CLOSE) kể cả khi flat → mỗi CLOSE cancel pending limit.
-FIX:  sig.side == 0 → ClosePositionsOnly() (chỉ đóng positions, không cancel pending).
-      Pending orders chỉ bị cancel bởi CancelOppositeOrders() khi signal ngược chiều đến.
-      File: mt5_bridge/XauDayTrader.mq5  hàm ExecuteSignal()
+BUG:  Khi tín hiệu mới tới, EA cancel cả pending lẫn đóng filled positions.
+      HasPosition() block tín hiệu mới nếu có PENDING cùng chiều → không update giá.
+FIX:  CancelPendingOrders() — cancel TẤT CẢ pending khi tín hiệu mới (cập nhật giá).
+      HasFilledPosition() — chỉ block new entry nếu đã có FILLED position.
+      Filled positions KHÔNG bị đụng bởi signals — để SL/TP/trail tự xử lý.
+      File: mt5_bridge/XauDayTrader.mq5  ExecuteSignal(), CancelPendingOrders(), HasFilledPosition()
+```
+
+### Zombie g_partialTPs records sau khi pending bị cancel
+```
+BUG:  Khi pending BuyLimit bị cancel (do tín hiệu mới), g_partialTPs record (ticket=0)
+      vẫn còn → lần fill sau bị gắn vào record zombie → partial TP bị trigger 2 lần.
+FIX:  CancelPendingOrders() xoá luôn g_partialTPs records có ticket==0 (chưa fill)
+      cùng chiều với order bị cancel.
+      File: mt5_bridge/XauDayTrader.mq5  hàm CancelPendingOrders()
 ```
 
 ### Kelly edge-decay block trading sau retrain

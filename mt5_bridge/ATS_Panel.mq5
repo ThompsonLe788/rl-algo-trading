@@ -443,9 +443,16 @@ void _DrawPanel()
    int c2lx = PanelX + 167;  // 2nd pair — label start
    int c2vx = PanelX + 252;  // 2nd pair — value start
 
-   // Panel height: 6 sections × (LH+LH_DIV) + 27 rows×LH + 6 rows×LH_SIG + top pad
-   // With LH=13, LH_DIV=8, LH_SIG=12 → ~465 px content; use 480 with padding
-   int panelH = 480;
+   // Dynamic height: sum of every row/separator + top & bottom padding
+   int panelH = 8                                              // top pad
+              + (LH + 5) + LH_DIV                             // title + sep
+              + LH + 2*LH + LH_DIV                            // MARKET (1 hdr + 2 rows) + sep
+              + LH + 4*LH + LH_DIV                            // POSITION (1 hdr + 4 rows) + sep
+              + LH + (LH_SIG-2) + SIG_ROWS*LH_SIG + 2*LH + LH_DIV  // SIGNALS + sep
+              + LH + 6*LH + LH_DIV                            // RISK (1 hdr + 6 rows) + sep
+              + LH + 5*LH + LH_DIV                            // AI MODEL (1 hdr + 5 rows) + sep
+              + LH + 3*LH                                     // SYSTEM (1 hdr + 3 rows)
+              + 14;                                           // bottom pad
    _DrawBg(PanelX, PanelY, PANEL_W, panelH);
 
    int ty = PanelY + 8;
@@ -703,8 +710,11 @@ void _DrawPanel()
    _T("sys_hb_v", hbS,           vx, ty, hbC);
    ty += LH;
 
+   string upStr = StringLen(g_pd.last_heartbeat) >= 19
+                ? StringSubstr(g_pd.last_heartbeat, 11, 8)
+                : (g_pd.unix_time > 0 ? TimeToString((datetime)g_pd.unix_time, TIME_SECONDS) : "---");
    _T("sys_up_l", "Updated   :", lx, ty, ClrLabel);
-   _T("sys_up_v", TimeToString(TimeLocal(), TIME_SECONDS), vx, ty, ClrTimestamp);
+   _T("sys_up_v", upStr, vx, ty, ClrTimestamp);
 
    ChartRedraw(0);
 }

@@ -14,7 +14,7 @@ Commands:
 Alerts (auto-push every 10s diff):
   KILL SWITCH activated
   Trade opened / closed
-  Drawdown > daily loss limit warning
+  Drawdown > 5% warning
   Heartbeat lost > 45s
   Daily PnL summary at 22:00 UTC
   Drift detection triggered
@@ -33,8 +33,11 @@ import time
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import DAILY_LOSS_LIMIT_PCT
+from config import EOD_HOUR_GMT, DAILY_LOSS_LIMIT_PCT, MAX_DRAWDOWN_PCT, PROFIT_TARGET_PCT
 from dashboard.state_reader import read_state, LiveState, SymbolState
+
+def read_ftmo_state():
+    return None
 
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
@@ -51,9 +54,9 @@ if load_dotenv and dotenv_path.exists():
 
 TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-POLL_INTERVAL = 10   # seconds between state diffs
-HB_WARN_SEC   = 45   # warn if heartbeat older than this
-EOD_SUMMARY_HOUR_UTC = 22   # send daily P&L summary at this UTC hour
+POLL_INTERVAL        = 10               # seconds between state diffs
+HB_WARN_SEC          = 45               # warn if heartbeat older than this
+EOD_SUMMARY_HOUR_UTC = EOD_HOUR_GMT     # send daily P&L summary at EOD hour
 
 # Path to signal_server.log for model-swap / drift detection scanning
 _LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "signal_server.log")
@@ -113,6 +116,10 @@ class AlertDiffer:
         self._last_summary_day: int = -1          # day-of-year for daily summary
         self._equity_at_session_open: float = 0.0 # for daily P&L calc
         self._last_log_size: int = 0              # for log scanning (drift/swap)
+        self._ftmo_daily_warned: bool = False     # suppress repeated daily DD warnings
+        self._ftmo_total_warned: bool = False     # suppress repeated total DD warnings
+        self._ftmo_prev_failed: bool = False      # track phase-fail state transitions
+        self._ftmo_prev_passed: bool = False      # track phase-pass state transitions
 
     def diff(self, cur: LiveState) -> list[str]:
         """Return list of alert message strings (may be empty)."""
@@ -134,12 +141,60 @@ class AlertDiffer:
                 + (f"\nReason: {_md(reason)}" if reason else "")
             )
 
-        # ── Drawdown warning (crosses DAILY_LOSS_LIMIT_PCT) ─────────────────
-        if cur.drawdown_pct >= DAILY_LOSS_LIMIT_PCT and prev.drawdown_pct < DAILY_LOSS_LIMIT_PCT:
+        # ── Drawdown warning (crosses half of daily loss limit) ─────────────
+        if cur.drawdown_pct >= DAILY_LOSS_LIMIT_PCT * 0.5 and prev.drawdown_pct < DAILY_LOSS_LIMIT_PCT * 0.5:
             alerts.append(
                 f"\u26a0\ufe0f Daily drawdown {_md(f'{cur.drawdown_pct:.1f}%')} "
                 f"\u2014 approaching kill limit"
             )
+
+        # ── FTMO-specific alerts ─────────────────────────────────────────────
+        ftmo = read_ftmo_state()
+        if ftmo:
+            phase = ftmo.get("phase", {})
+            daily_dd   = float(phase.get("daily_loss_pct", 0.0))
+            total_dd   = float(phase.get("total_dd_pct", 0.0))
+            max_daily  = float(phase.get("max_daily_loss_pct", DAILY_LOSS_LIMIT_PCT))
+            max_total  = float(phase.get("max_total_loss_pct", MAX_DRAWDOWN_PCT))
+            # Warn at 80% of each FTMO limit
+            daily_warn_thresh = max_daily * 0.80
+            total_warn_thresh = max_total * 0.80
+            if daily_dd >= daily_warn_thresh and not self._ftmo_daily_warned:
+                alerts.append(
+                    f"\u26a0\ufe0f *FTMO Daily DD* {_md(f'{daily_dd:.2f}%')} "
+                    f"/ limit {_md(f'{max_daily:.1f}%')} "
+                    f"\\({_md(f'{daily_dd/max_daily*100:.0f}%')} of limit\\)"
+                )
+                self._ftmo_daily_warned = True
+            elif daily_dd < daily_warn_thresh * 0.5:
+                self._ftmo_daily_warned = False   # reset once DD recovers
+
+            if total_dd >= total_warn_thresh and not self._ftmo_total_warned:
+                alerts.append(
+                    f"\U0001f534 *FTMO Total DD* {_md(f'{total_dd:.2f}%')} "
+                    f"/ limit {_md(f'{max_total:.1f}%')} "
+                    f"\\({_md(f'{total_dd/max_total*100:.0f}%')} of limit\\)"
+                )
+                self._ftmo_total_warned = True
+            elif total_dd < total_warn_thresh * 0.5:
+                self._ftmo_total_warned = False
+
+            now_failed = bool(phase.get("failed"))
+            now_passed = bool(phase.get("passed"))
+            if now_failed and not self._ftmo_prev_failed:
+                reason = phase.get("fail_reason", "")
+                alerts.append(
+                    f"\U0001f6ab *FTMO CHALLENGE FAILED*"
+                    + (f"\nReason: {_md(reason)}" if reason else "")
+                )
+            if now_passed and not self._ftmo_prev_passed:
+                _profit_str = f'+{phase.get("profit_pct", 0):.2f}%'
+                alerts.append(
+                    f"\U0001f3c6 *FTMO PHASE PASSED\\!*\n"
+                    f"Profit: {_md(_profit_str)}"
+                )
+            self._ftmo_prev_failed = now_failed
+            self._ftmo_prev_passed = now_passed
 
         # ── Per-symbol position changes ─────────────────────────────────────
         all_syms = set(cur.symbols) | set(prev.symbols)
@@ -293,6 +348,33 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"*Heartbeat:* {hb_str}",
     ]
 
+    # FTMO phase info (if available)
+    ftmo = read_ftmo_state()
+    if ftmo:
+        phase = ftmo.get("phase", {})
+        if phase:
+            phase_name  = phase.get("phase", "?").upper()
+            acct_size   = phase.get("account_size", 0)
+            profit_pct  = phase.get("profit_pct", 0.0)
+            profit_tgt  = phase.get("profit_target_pct", PROFIT_TARGET_PCT)
+            daily_dd    = phase.get("daily_loss_pct", 0.0)
+            max_daily   = phase.get("max_daily_loss_pct", DAILY_LOSS_LIMIT_PCT)
+            total_dd    = phase.get("total_dd_pct", 0.0)
+            max_total   = phase.get("max_total_loss_pct", MAX_DRAWDOWN_PCT)
+            t_days      = phase.get("trading_days", 0)
+            min_days    = phase.get("min_trading_days", 4)
+            passed      = phase.get("passed", False)
+            failed      = phase.get("failed", False)
+            outcome = "\U0001f3c6 PASSED" if passed else ("\U0001f6ab FAILED" if failed else "\U0001f7e1 IN PROGRESS")
+            lines += [
+                "",
+                f"*FTMO {_md(phase_name)} ${_md(f'{acct_size:,.0f}')}* — {outcome}",
+                f"  Profit: {_md(f'{profit_pct:+.2f}%')} / target {_md(f'{profit_tgt:.0f}%')}",
+                f"  Daily DD: {_md(f'{daily_dd:.2f}%')} / {_md(f'{max_daily:.1f}%')}",
+                f"  Total DD: {_md(f'{total_dd:.2f}%')} / {_md(f'{max_total:.1f}%')}",
+                f"  Trading days: {_md(str(t_days))} / {_md(str(min_days))} required",
+            ]
+
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
@@ -369,49 +451,7 @@ async def _on_startup(app: Application):
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _acquire_bot_lock() -> bool:
-    """Single-instance guard — prevents duplicate Telegram bot processes."""
-    import atexit
-    import subprocess as _sp
-
-    lock = Path(__file__).resolve().parent.parent / "logs" / "telegram_bot.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-
-    def _pid_alive(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, AttributeError):
-            pass
-        try:
-            out = _sp.check_output(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                stderr=_sp.DEVNULL,
-            ).decode(errors="replace")
-            return str(pid) in out
-        except Exception:
-            return False
-
-    if lock.exists():
-        try:
-            existing_pid = int(lock.read_text().strip())
-            if _pid_alive(existing_pid):
-                logger.warning(
-                    f"Telegram bot already running (PID {existing_pid}). Exiting."
-                )
-                return False
-        except ValueError:
-            pass
-
-    lock.write_text(str(os.getpid()))
-    atexit.register(lambda: lock.unlink(missing_ok=True))
-    return True
-
-
 def main():
-    if not _acquire_bot_lock():
-        return
-
     if not TOKEN:
         raise RuntimeError(
             "TELEGRAM_TOKEN env var not set. "

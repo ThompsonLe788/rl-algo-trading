@@ -21,7 +21,10 @@ from pathlib import Path
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import ZMQ_SIGNAL_ADDR, EOD_HOUR_GMT, LOG_DIR, LIVE_STATE_PATH, get_symbol_config
+from config import (
+    ZMQ_SIGNAL_ADDR, EOD_HOUR_GMT, LOG_DIR, LIVE_STATE_PATH, get_symbol_config,
+    HEARTBEAT_INTERVAL, SPREAD_SPIKE_MULT,
+)
 from risk.kelly import KellyPositionSizer, vwap_slice_orders
 from risk.kill_switch import KillSwitch
 from risk.news_filter import NewsFilter
@@ -350,9 +353,9 @@ class SignalServer:
 
     def __init__(
         self,
+        symbol: str,
         addr: str = ZMQ_SIGNAL_ADDR,
-        symbol: str = "XAUUSD",
-        heartbeat_interval: float = 5.0,
+        heartbeat_interval: float = HEARTBEAT_INTERVAL,
         file_fallback: bool = True,
         zmq_socket=None,
         zmq_lock=None,   # threading.Lock for thread-safe sends on shared socket
@@ -397,7 +400,7 @@ class SignalServer:
         # Spread monitoring: rolling history of recent spreads
         # Block entry when current_spread > SPREAD_SPIKE_MULT × rolling average
         self._spread_history: deque[float] = deque(maxlen=200)
-        self._spread_spike_mult: float = 3.0   # 3× normal spread = skip
+        self._spread_spike_mult: float = SPREAD_SPIKE_MULT
         self._signal_count = 0
         self.state_writer = LiveStateWriter.instance()
         self.state_writer.register_server()

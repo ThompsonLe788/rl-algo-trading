@@ -102,10 +102,12 @@ class AutoRetrainer:
         stop_event: threading.Event,
         set_status_fn: Callable[[str], None] | None = None,
         state_writer=None,   # LiveStateWriter | None — writes model info to JSON
+        kelly=None,          # KellyPositionSizer | None — reset after retrain
     ):
         self.symbol = symbol
         self.model_ref = model_ref
         self.perf_monitor = perf_monitor
+        self._kelly = kelly
         self._stop_event = stop_event
         self._set_status = set_status_fn or (lambda s: None)
         self._state_writer = state_writer
@@ -241,6 +243,8 @@ class AutoRetrainer:
                 self._backup_and_deploy(new_model)
                 self.model_ref.swap(new_model)
                 self.perf_monitor.reset()   # reset drift counter for fresh window
+                if self._kelly is not None:
+                    self._kelly.reset_history()  # old edge data irrelevant for new model
                 self._last_retrain_time = datetime.now(timezone.utc).isoformat()
                 logger.info(
                     f"[{self.symbol}] ✓ New model ACCEPTED — "

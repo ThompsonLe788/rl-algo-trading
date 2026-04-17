@@ -23,6 +23,10 @@ class SymbolState:
     drawdown_pct: float = 0.0
     last_signal: dict = field(default_factory=dict)
     timestamp: str = ""
+    # Learning / retraining state (written by AutoRetrainer via update_model)
+    win_rate: float | None = None
+    model_sharpe: float | None = None
+    last_retrain_reason: str | None = None
 
     @property
     def position_str(self) -> str:
@@ -110,6 +114,8 @@ def read_state(path: Path | None = None) -> LiveState:
     for key, val in raw.items():
         if key.startswith("_") or not isinstance(val, dict):
             continue
+        wr_raw = val.get("win_rate")
+        sh_raw = val.get("model_sharpe")
         symbols[key] = SymbolState(
             symbol=key,
             position=int(val.get("position", 0)),
@@ -120,6 +126,9 @@ def read_state(path: Path | None = None) -> LiveState:
             drawdown_pct=float(val.get("drawdown_pct", 0.0)),
             last_signal=val.get("last_signal", {}),
             timestamp=val.get("timestamp", ""),
+            win_rate=float(wr_raw) if wr_raw is not None else None,
+            model_sharpe=float(sh_raw) if sh_raw is not None else None,
+            last_retrain_reason=val.get("last_retrain_reason"),
         )
 
     result = LiveState(

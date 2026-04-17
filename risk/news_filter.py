@@ -30,15 +30,13 @@ from pathlib import Path
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import LOG_DIR
+from config import LOG_DIR, NEWS_BLACKOUT_BEFORE_MINS, NEWS_BLACKOUT_AFTER_MINS
 
 logger = logging.getLogger("news_filter")
+log    = logging.getLogger(__name__)
 
-log = logging.getLogger(__name__)
-
-# Blackout window around each event
-PRE_EVENT_MIN  = 15
-POST_EVENT_MIN = 10
+PRE_EVENT_MIN  = NEWS_BLACKOUT_BEFORE_MINS
+POST_EVENT_MIN = NEWS_BLACKOUT_AFTER_MINS
 
 
 # ---------------------------------------------------------------------------

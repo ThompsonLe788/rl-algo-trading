@@ -75,9 +75,11 @@ class KillSwitch:
         daily_loss_limit_pct: float = DAILY_LOSS_LIMIT_PCT,
         eod_hour_gmt: int = EOD_HOUR_GMT,
         news_filter=None,          # NewsFilter | None
-        symbol: str = "XAUUSD",
+        symbol: str = "",
         session_filter: bool = True,
     ):
+        if session_filter and not symbol:
+            raise ValueError("KillSwitch: symbol is required when session_filter=True")
         self.max_dd_pct = max_drawdown_pct
         self.daily_loss_pct = daily_loss_limit_pct
         self.eod_hour = eod_hour_gmt

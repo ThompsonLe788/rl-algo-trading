@@ -14,7 +14,14 @@ import streamlit as st
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from config import EOD_HOUR_GMT, LIVE_STATE_PATH, MAX_HOLD_BARS
+import json
+from pathlib import Path
+
+from config import (
+    EOD_HOUR_GMT, LIVE_STATE_PATH, MAX_HOLD_BARS, LOG_DIR, DRIFT_WIN_RATE_THRESHOLD,
+    KELLY_PRIOR_ALPHA, KELLY_PRIOR_BETA, PNL_SCRATCH_THRESHOLD as _CFG_SCRATCH,
+    SL_ADJ_TABLE,
+)
 from dashboard.state_reader import read_state, read_worker_status, read_active_charts, tail_log
 
 # ─── Page config (runs once, outside fragment) ────────────────────────────────
@@ -307,6 +314,128 @@ def _z_chart(sym: str, history: list) -> "go.Figure | None":
     fig.add_hline(y=-2.0, line=dict(color="#3fb950", dash="dash", width=1))
     fig.add_hline(y=0.0,  line=dict(color="#30363d", dash="dot",  width=1))
     return _plotly_dark(fig, height=200, title=f"{sym} — Z-Score")
+
+
+# ─── Learning panel helper ───────────────────────────────────────────────────
+
+_PRIOR_A = KELLY_PRIOR_ALPHA
+_PRIOR_B = KELLY_PRIOR_BETA
+_SCRATCH  = _CFG_SCRATCH
+
+def _sl_adj(wr: float) -> float:
+    for threshold, mult in SL_ADJ_TABLE:
+        if wr > threshold:
+            return mult
+    return 1.50
+
+def _learning_panel(sym: str, sym_state) -> None:
+    """Expander showing self-learning progress: SL/TP buckets, drift, retrain."""
+    with st.expander("Self-Learning Progress", expanded=False):
+
+        # ── SL/TP optimizer buckets ───────────────────────────────────────────
+        sltp_path = LOG_DIR / f"sl_tp_state_{sym.lower()}.json"
+        if sltp_path.exists():
+            try:
+                raw = json.loads(sltp_path.read_text())
+                rows = []
+                for key, trades in raw.items():
+                    if not trades:
+                        continue
+                    regime_str, session = key.split("|", 1)
+                    regime = int(regime_str)
+                    wins   = sum(1 for t in trades if t["pnl"] >  _SCRATCH)
+                    losses = sum(1 for t in trades if t["pnl"] < -_SCRATCH)
+                    a, b   = _PRIOR_A + wins, _PRIOR_B + losses
+                    wr     = a / (a + b)
+                    adj    = _sl_adj(wr)
+                    regime_label = {1: "TREND", 0: "RANGE", -1: "?"}.get(regime, str(regime))
+                    rows.append({
+                        "Regime":  regime_label,
+                        "Session": session.upper(),
+                        "Trades":  len(trades),
+                        "Win Rate": f"{wr:.1%}",
+                        "SL ×adj": f"{adj:.2f}",
+                        "BE-R":    f"{(1 - wr) / wr:.2f}" if wr > 0 else "—",
+                    })
+
+                if rows:
+                    st.markdown("**SL/TP Optimizer — learned buckets**")
+                    # Color-code win rate column manually via markdown table
+                    hdr = "| Regime | Session | Trades | Win Rate | SL ×adj | BE-R |\n"
+                    hdr += "|--------|---------|-------:|---------:|--------:|-----:|\n"
+                    for r in sorted(rows, key=lambda x: (x["Regime"], x["Session"])):
+                        wr_raw = float(r["Win Rate"].strip("%")) / 100
+                        wr_icon = "🟢" if wr_raw > 0.55 else "🟡" if wr_raw > 0.45 else "🔴"
+                        hdr += (f"| {r['Regime']} | {r['Session']} | {r['Trades']} "
+                                f"| {wr_icon} {r['Win Rate']} | {r['SL ×adj']} | {r['BE-R']} |\n")
+                    st.markdown(hdr)
+                    total = sum(r["Trades"] for r in rows)
+                    st.caption(f"Total closed trades: {total} across {len(rows)} buckets "
+                               f"(min 10 to activate adaptive mode)")
+                else:
+                    st.info("SL/TP optimizer: no closed trades yet — using ATR defaults.")
+            except Exception as e:
+                st.caption(f"SL/TP state read error: {e}")
+        else:
+            st.info("SL/TP optimizer state file not found.")
+
+        st.divider()
+
+        # ── Drift & retrain status ────────────────────────────────────────────
+        st.markdown("**Model Drift & Retraining**")
+        if sym_state is not None:
+            wr     = getattr(sym_state, "win_rate", None)
+            sharpe = getattr(sym_state, "model_sharpe", None)
+            reason = getattr(sym_state, "last_retrain_reason", None)
+
+            c1, c2, c3 = st.columns(3)
+            if wr is not None:
+                bar_pct  = min(100, int(wr * 100 / DRIFT_WIN_RATE_THRESHOLD * 100)) if DRIFT_WIN_RATE_THRESHOLD > 0 else 0
+                wr_color = "#3fb950" if wr >= DRIFT_WIN_RATE_THRESHOLD else "#f85149"
+                c1.markdown(
+                    f'<div class="metric-card"><div class="label">Live Win Rate</div>'
+                    f'<div class="value" style="color:{wr_color};">{wr:.1%}</div>'
+                    f'<div style="font-size:0.6rem;color:#8b949e;">drift threshold {DRIFT_WIN_RATE_THRESHOLD:.0%}</div></div>',
+                    unsafe_allow_html=True)
+            if sharpe is not None:
+                sh_color = "#3fb950" if sharpe > 0 else "#f85149"
+                c2.markdown(
+                    f'<div class="metric-card"><div class="label">Model Sharpe</div>'
+                    f'<div class="value" style="color:{sh_color};">{sharpe:.3f}</div></div>',
+                    unsafe_allow_html=True)
+            if reason:
+                c3.markdown(
+                    f'<div class="metric-card"><div class="label">Last Retrain</div>'
+                    f'<div class="value" style="font-size:0.7rem;color:#bc8cff;">{reason}</div></div>',
+                    unsafe_allow_html=True)
+
+        st.divider()
+
+        # ── Kelly scalars ─────────────────────────────────────────────────────
+        kelly_path = LOG_DIR / f"kelly_state_{sym.lower()}.json"
+        if kelly_path.exists():
+            try:
+                ks     = json.loads(kelly_path.read_text())
+                trades = ks.get("trades", [])
+                wins   = sum(1 for t in trades if t.get("pnl", 0) >  _SCRATCH)
+                losses = sum(1 for t in trades if t.get("pnl", 0) < -_SCRATCH)
+                wr_k   = (_PRIOR_A + wins) / (_PRIOR_A + _PRIOR_B + wins + losses)
+                streak = 0
+                for t in reversed(trades):
+                    if t.get("pnl", 0) < -_SCRATCH:
+                        streak += 1
+                    elif t.get("pnl", 0) > _SCRATCH:
+                        break
+                streak_scalar = max(0.25, 1.0 - streak * 0.25)
+
+                st.markdown("**Kelly Position Sizer — learned state**")
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("Bayesian Win Rate",  f"{wr_k:.1%}")
+                k2.metric("Consec. Losses",     f"{streak}  (×{streak_scalar:.2f})")
+                k3.metric("Total Trades",       str(len(trades)))
+                k4.metric("Wins / Losses",      f"{wins} / {losses}")
+            except Exception as e:
+                st.caption(f"Kelly state read error: {e}")
 
 
 # ─── Main dashboard (fragment = smooth partial refresh, no page flicker) ──────
@@ -684,6 +813,9 @@ def _dashboard() -> None:
                   <div><div class="sf-label">Lot</div>
                        <div class="sf-value">{sig_data.get('lot', 0):.2f}</div></div>
                 </div>""", unsafe_allow_html=True)
+
+            # ── Learning progress expander ────────────────────────────────────
+            _learning_panel(sym, sym_state)
 
             # ── Log expander ──────────────────────────────────────────────────
             sym_logs = [ln for ln in all_log_lines if sym in ln][-25:]

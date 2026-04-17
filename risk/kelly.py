@@ -30,6 +30,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     KELLY_FRACTION, MAX_RISK_PER_TRADE, LEVERAGE, ROLLING_WINDOW,
     LOG_DIR, MAX_DRAWDOWN_PCT, get_symbol_config,
+    KELLY_PRIOR_ALPHA, KELLY_PRIOR_BETA,
+    PNL_SCRATCH_THRESHOLD as _CFG_SCRATCH,
+    DD_TAPER_START_PCT,
+    VOL_REGIME_SPIKE_ENTER, VOL_REGIME_SPIKE_EXIT,
+    VOL_REGIME_ELEVATED_ENTER, VOL_REGIME_ELEVATED_EXIT,
 )
 
 logger = logging.getLogger("kelly")
@@ -52,16 +57,16 @@ class KellyPositionSizer:
     """Fractional Kelly with rolling 200-trade Bayesian stats,
     drawdown scaling, regime adjustment, and edge-decay guard."""
 
-    # -- Bayesian prior: Beta(2,2) → mildly informative 50% prior
-    PRIOR_ALPHA = 2.0
-    PRIOR_BETA = 2.0
+    # -- Bayesian prior — from config so tuning is centralised
+    PRIOR_ALPHA = KELLY_PRIOR_ALPHA
+    PRIOR_BETA  = KELLY_PRIOR_BETA
 
     # -- Minimum trades before trusting Kelly (use fixed fractional before)
     MIN_TRADES_FOR_KELLY = 30
 
     # -- Drawdown scaling: at dd_full_pct, size → 0
-    DD_TAPER_START = 5.0   # start tapering at 5% DD
-    DD_TAPER_END = MAX_DRAWDOWN_PCT  # fully off at kill-switch level
+    DD_TAPER_START = DD_TAPER_START_PCT   # from config
+    DD_TAPER_END   = MAX_DRAWDOWN_PCT     # fully off at kill-switch level
 
     # -- Edge-decay: if last N trades have negative expectancy → skip
     EDGE_DECAY_WINDOW = 20
@@ -75,7 +80,7 @@ class KellyPositionSizer:
 
     def __init__(
         self,
-        symbol: str = "XAUUSD",
+        symbol: str,
         fraction: float = KELLY_FRACTION,
         max_risk: float = MAX_RISK_PER_TRADE,
         leverage: int | None = None,
@@ -100,11 +105,17 @@ class KellyPositionSizer:
         # Drawdown tracking (fed externally)
         self._current_dd_pct: float = 0.0
 
-        # Active regime (fed externally)
-        self._regime: int = -1  # 0=range, 1=trend
+        # Active regime (fed externally) — hysteresis: require N consecutive
+        # same predictions before switching to prevent T-KAN tick noise
+        self._regime: int = -1          # confirmed regime
+        self._regime_pending: int = -1  # candidate regime
+        self._regime_confirm: int = 0   # consecutive-match counter
 
         # Volatility regime: rolling realized-vol history for z-score (⑩)
         self._rvol_history: deque[float] = deque(maxlen=self.VOL_HISTORY_LEN)
+        # Hysteresis: current vol state persists until opposite threshold is crossed
+        # 0 = normal (1.0×), 1 = elevated (0.75×), 2 = spike (0.50×)
+        self._vol_state: int = 0
 
         self._try_load()
 
@@ -115,9 +126,18 @@ class KellyPositionSizer:
         try:
             if self.persist_path.exists():
                 data = json.loads(self.persist_path.read_text())
+                loaded, skipped = 0, 0
                 for rec in data.get("trades", []):
+                    if rec.get("timestamp", 0.0) == 0.0:
+                        skipped += 1
+                        continue
                     self.trade_history.append(TradeRecord(**rec))
-                logger.info("Loaded %d trades from %s", len(self.trade_history), self.persist_path)
+                    loaded += 1
+                if skipped:
+                    logger.info("Skipped %d synthetic (timestamp=0) trades on load", skipped)
+                logger.info("Loaded %d trades from %s", loaded, self.persist_path)
+                if skipped:
+                    self.save()  # write back cleaned state immediately
         except Exception as e:
             logger.warning("Could not load kelly state: %s", e)
 
@@ -125,19 +145,45 @@ class KellyPositionSizer:
         data = {"trades": [asdict(t) for t in self.trade_history]}
         self.persist_path.write_text(json.dumps(data))
 
+    def reset_history(self) -> None:
+        """Clear trade history after a model retrain so old edge-decay data
+        from the previous model does not block the new model from trading."""
+        self.trade_history.clear()
+        self._regime = -1
+        self._regime_pending = -1
+        self._regime_confirm = 0
+        self.save()
+        logger.info("[%s] Kelly trade history reset after model retrain", self.symbol)
+
     # ------------------------------------------------------------------
     # External state feeds
     # ------------------------------------------------------------------
     def set_drawdown(self, dd_pct: float):
         self._current_dd_pct = max(dd_pct, 0.0)
 
+    # Require this many consecutive identical predictions before accepting a regime change
+    REGIME_CONFIRM_N: int = 3
+
     def set_regime(self, regime: int):
-        self._regime = regime
+        if regime == self._regime_pending:
+            self._regime_confirm += 1
+            if self._regime_confirm >= self.REGIME_CONFIRM_N:
+                self._regime = regime
+        else:
+            self._regime_pending = regime
+            self._regime_confirm = 1
+
+    RVOL_MIN_CHANGE = 0.01  # only record if >1% relative change (reduces z-score jitter)
 
     def update_rvol(self, rvol: float):
         """Feed current realized volatility for macro vol-regime tracking. (⑩)"""
-        if rvol > 0:
-            self._rvol_history.append(rvol)
+        if rvol <= 0:
+            return
+        if self._rvol_history:
+            last = self._rvol_history[-1]
+            if abs(rvol - last) / (last + 1e-9) < self.RVOL_MIN_CHANGE:
+                return
+        self._rvol_history.append(rvol)
 
     # ------------------------------------------------------------------
     # Record trades
@@ -149,10 +195,7 @@ class KellyPositionSizer:
     # ------------------------------------------------------------------
     # Rolling Bayesian win rate  Beta(α + wins, β + losses)
     # ------------------------------------------------------------------
-    # Minimum PnL magnitude to count as a win or loss (1 pip = $0.01 equivalent).
-    # Trades with |pnl| < this threshold are treated as scratch/neutral and excluded
-    # from the Bayesian win-rate to avoid inflating the loss count with break-evens.
-    PNL_SCRATCH_THRESHOLD = 0.01
+    PNL_SCRATCH_THRESHOLD = _CFG_SCRATCH
 
     @property
     def win_rate(self) -> float:
@@ -205,8 +248,8 @@ class KellyPositionSizer:
         for t in reversed(self.trade_history):
             if t.pnl < -self.PNL_SCRATCH_THRESHOLD:
                 streak += 1
-            else:
-                break
+            elif t.pnl > self.PNL_SCRATCH_THRESHOLD:
+                break   # genuine win ends streak; scratch trades are skipped
         return streak
 
     # ------------------------------------------------------------------
@@ -269,24 +312,35 @@ class KellyPositionSizer:
     def _vol_regime_scalar(self) -> float:
         """Scale down sizing when realized volatility is elevated. (⑩)
 
-        Compares current rvol (last reading) against the rolling mean/std
-        of the past VOL_HISTORY_LEN bars:
-          rvol z-score > 2σ  → 0.50× (half size — macro vol spike)
-          rvol z-score > 1σ  → 0.75× (cautious — elevated vol)
-          otherwise          → 1.00×
+        Uses 5-bar smoothing + hysteresis to prevent tick-by-tick flipping:
+          Enter spike  (0.50×) when z > 2.5 — exit when z < 1.5
+          Enter elevated (0.75×) when z > 1.5 — exit when z < 0.5
+          Normal (1.00×) otherwise
         """
         if len(self._rvol_history) < 30:
             return 1.0
         hist = list(self._rvol_history)
-        current = hist[-1]
+        smoothed = float(np.mean(hist[-5:]))
         mean_v = float(np.mean(hist))
         std_v  = float(np.std(hist)) + 1e-9
-        z = (current - mean_v) / std_v
-        if z > 2.0:
-            return 0.50
-        if z > 1.0:
-            return 0.75
-        return 1.0
+        z = (smoothed - mean_v) / std_v
+
+        # Hysteresis: transition thresholds differ for entry vs exit
+        if self._vol_state == 2:        # currently spike
+            if z < VOL_REGIME_SPIKE_EXIT:
+                self._vol_state = 1     # fall back to elevated
+        elif self._vol_state == 1:      # currently elevated
+            if z > VOL_REGIME_SPIKE_ENTER:
+                self._vol_state = 2     # escalate to spike
+            elif z < VOL_REGIME_ELEVATED_EXIT:
+                self._vol_state = 0     # back to normal
+        else:                           # currently normal
+            if z > VOL_REGIME_SPIKE_ENTER:
+                self._vol_state = 2
+            elif z > VOL_REGIME_ELEVATED_ENTER:
+                self._vol_state = 1
+
+        return {0: 1.00, 1: 0.75, 2: 0.50}[self._vol_state]
 
     def optimal_fraction(self, p: float | None = None, b: float | None = None) -> float:
         """Enhanced fractional Kelly with all guards applied.

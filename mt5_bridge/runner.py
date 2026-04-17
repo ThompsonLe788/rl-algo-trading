@@ -309,7 +309,9 @@ class SymbolWorker(threading.Thread):
             from mt5_bridge.signal_server import LiveStateWriter
             # Initialize kelly early so it's never unbound in any code path
             from risk.kelly import KellyPositionSizer, PortfolioKellyAllocator
-            kelly = KellyPositionSizer(symbol=self.symbol)
+            from risk.sl_tp_optimizer import SLTPOptimizer
+            kelly       = KellyPositionSizer(symbol=self.symbol)
+            sl_tp_opt   = SLTPOptimizer(symbol=self.symbol)
             _portfolio_alloc = PortfolioKellyAllocator.instance()
 
             sym_cfg = get_symbol_config(self.symbol)
@@ -337,6 +339,26 @@ class SymbolWorker(threading.Thread):
                 self._set_status("error")
                 return
 
+            # After a retrain reset kelly.trade_history is empty.
+            # Fast-forward _last_deal to the current MT5 max ticket so
+            # _sync_closed_trades won't re-add stale deals from the old model.
+            if not kelly.trade_history:
+                try:
+                    from datetime import timedelta as _td
+                    _hist = mt5.history_deals_get(
+                        datetime.now(timezone.utc) - _td(hours=48),
+                        datetime.now(timezone.utc),
+                        group=f"*{self.symbol}*",
+                    )
+                    if _hist:
+                        _last_deal[self.symbol] = max(d.ticket for d in _hist)
+                        logger.info(
+                            "[%s] Kelly fresh start — skipping %d existing MT5 deals",
+                            self.symbol, len(_hist),
+                        )
+                except Exception as _fwd_err:
+                    logger.debug("[%s] _last_deal fast-forward failed: %s", self.symbol, _fwd_err)
+
             _eq_cache: list[float] = [0.0]
 
             def account_info():
@@ -355,33 +377,38 @@ class SymbolWorker(threading.Thread):
 
             # Background heartbeat thread — flushes live_state.json AND sends
             # ZMQ heartbeat every 5s even when no ticks arrive (EOD, news, etc.)
+            from config import HEARTBEAT_ENABLED as _HB_ENABLED
+
             def _heartbeat_loop():
                 while not self._stop_event.is_set():
                     try:
                         eq, bal = account_info()
+                        with _acct_extra_lock:
+                            _extra_snapshot = dict(_last_acct_extra)
                         LiveStateWriter.instance().update_account(
-                            eq, bal, _last_dd_pct[0], **_last_acct_extra)
+                            eq, bal, _last_dd_pct[0], **_extra_snapshot)
                         state_writer.flush()
                     except Exception:
                         pass
-                    try:
-                        import zmq as _zmq
-                        _sock = self.__class__.get_shared_socket()
-                        _hb_payload = json.dumps({
-                            "heartbeat": True,
-                            "symbol": self.symbol,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        })
-                        # EA expects single-frame: "SYMBOL {...json...}"
-                        _hb_frame = f"{self.symbol} {_hb_payload}".encode()
-                        with self.__class__._zmq_send_lock:
-                            _sock.send(_hb_frame, flags=_zmq.NOBLOCK)
-                    except Exception:
-                        pass
+                    if _HB_ENABLED:
+                        try:
+                            import zmq as _zmq
+                            _sock = self.__class__.get_shared_socket()
+                            _hb_payload = json.dumps({
+                                "heartbeat": True,
+                                "symbol": self.symbol,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            })
+                            _hb_frame = f"{self.symbol} {_hb_payload}".encode()
+                            with self.__class__._zmq_send_lock:
+                                _sock.send(_hb_frame, flags=_zmq.NOBLOCK)
+                        except Exception:
+                            pass
                     self._stop_event.wait(timeout=5.0)
 
             _last_dd_pct = [0.0]
-            _last_acct_extra: dict = {}  # dollar amounts updated each tick, read by heartbeat
+            _last_acct_extra: dict = {}
+            _acct_extra_lock = threading.Lock()
             _hb_thread = threading.Thread(
                 target=_heartbeat_loop, name=f"hb-{self.symbol}", daemon=True
             )
@@ -404,6 +431,7 @@ class SymbolWorker(threading.Thread):
                 stop_event=self._stop_event,
                 set_status_fn=self._set_status,
                 state_writer=state_writer,
+                kelly=kelly,
             )
             retrainer.start()
 
@@ -441,6 +469,12 @@ class SymbolWorker(threading.Thread):
 
             zmq_socket = self.__class__.get_shared_socket()
             _tick_count = 0  # used to throttle periodic update_model() calls
+
+            # Cache active_symbols — refresh every SCAN_INTERVAL seconds.
+            # Avoids N flipping tick-by-tick when a worker briefly changes
+            # state, which would cause equity_budget (and kelly_f) to jump.
+            _active_syms_cache: list[str] = [self.symbol]
+            _active_syms_ts: float = 0.0
 
             for tick_tuple in tick_stream:
                 if self._stop_event.is_set():
@@ -496,11 +530,16 @@ class SymbolWorker(threading.Thread):
                     except Exception as _tkan_err:
                         logger.warning(f"[{self.symbol}] T-KAN predict failed: {_tkan_err}")
 
+                # Safe defaults so sl_dist / equity_budget are always defined
+                sl_dist      = tick_atr * sym_cfg.get("atr_mult_sl", 1.5)
+                equity_budget = equity   # overwritten inside try; default = full equity
                 try:
-                    sl_dist    = tick_atr * sym_cfg.get("atr_mult_sl", 1.5)
+                    sl_mult    = sl_tp_opt.get_sl_mult(_regime, now_utc.hour)
+                    sl_dist    = tick_atr * sl_mult
                     init_eq    = self._risk.initial_equity  # public property
+                    peak_eq    = self._risk.peak_equity or init_eq
                     kelly.set_drawdown(
-                        (init_eq - equity) / max(init_eq, 1) * 100.0
+                        (peak_eq - equity) / max(peak_eq, 1) * 100.0
                     )
                     kelly.set_regime(_regime)
                     kelly.update_rvol(tick_atr)
@@ -515,10 +554,15 @@ class SymbolWorker(threading.Thread):
                             )
 
                     # Correlation-adjusted equity budget (falls back to equity/N
-                    # when < 20 observations or only one symbol active)
-                    _active_syms = self.__class__.active_symbols()
+                    # when < 20 observations or only one symbol active).
+                    # Refresh active-symbol list at SCAN_INTERVAL to prevent N
+                    # from flipping tick-by-tick (which would make kelly_f jump).
+                    _now_ts = time.monotonic()
+                    if _now_ts - _active_syms_ts >= SCAN_INTERVAL:
+                        _active_syms_cache = self.__class__.active_symbols()
+                        _active_syms_ts    = _now_ts
                     equity_budget = _portfolio_alloc.equity_budget(
-                        self.symbol, equity, _active_syms
+                        self.symbol, equity, _active_syms_cache
                     )
 
                     kelly_lot = kelly.calc_lot_size(
@@ -541,15 +585,16 @@ class SymbolWorker(threading.Thread):
                 _peak_eq = self._risk.peak_equity or balance
                 _sess_eq = self._risk.session_start_equity or balance
                 _limit_base = max(_peak_eq, balance)
-                _last_acct_extra.update(
-                    daily_loss_usd=risk_result.get("daily_loss_usd", 0.0),
-                    max_loss_usd=risk_result.get("total_loss_usd", 0.0),
-                    profit_usd=max(0.0, round(equity - _sess_eq, 2)),
-                    daily_loss_limit_usd=round(_limit_base * DAILY_LOSS_LIMIT_PCT / 100, 2),
-                    max_loss_limit_usd=round(_limit_base * MAX_DRAWDOWN_PCT / 100, 2),
-                    profit_target_usd=round(_limit_base * PROFIT_TARGET_PCT / 100, 2),
-                    initial_balance=round(_limit_base, 2),
-                )
+                with _acct_extra_lock:
+                    _last_acct_extra.update(
+                        daily_loss_usd=risk_result.get("daily_loss_usd", 0.0),
+                        max_loss_usd=risk_result.get("total_loss_usd", 0.0),
+                        profit_usd=max(0.0, round(equity - _sess_eq, 2)),
+                        daily_loss_limit_usd=round(_limit_base * DAILY_LOSS_LIMIT_PCT / 100, 2),
+                        max_loss_limit_usd=round(_limit_base * MAX_DRAWDOWN_PCT / 100, 2),
+                        profit_target_usd=round(_limit_base * PROFIT_TARGET_PCT / 100, 2),
+                        initial_balance=round(_limit_base, 2),
+                    )
 
                 if risk_result.get("close_all"):
                     logger.critical(
@@ -564,6 +609,14 @@ class SymbolWorker(threading.Thread):
                     logger.warning(f"[{self.symbol}] Blocked: {risk_result['reason']}")
                     _send(zmq_socket, self.symbol, "HOLD", 0.0, 0.0,
                           risk_result["reason"], self.__class__._zmq_send_lock)
+                    continue
+
+                # Block new entries when T-KAN hasn't classified yet — regime=-1
+                # caused 3 large losses ($3235) before warm-up completed.
+                if _regime == -1:
+                    logger.debug(f"[{self.symbol}] HOLD: regime unknown (T-KAN not warmed up)")
+                    _send(zmq_socket, self.symbol, "HOLD", 0.0, 0.0,
+                          "regime_unknown", self.__class__._zmq_send_lock)
                     continue
 
                 try:
@@ -583,23 +636,30 @@ class SymbolWorker(threading.Thread):
                 price       = float(tick_df["close"].iloc[-1])
                 z_score     = float(feats["z_score"].iloc[-1]) if "z_score" in feats.columns else 0.0
                 win_prob    = float(kelly.win_rate)
+                tp_mult     = sl_tp_opt.get_tp_mult(_regime, now_utc.hour)
+                tp_dist     = tick_atr * tp_mult
 
                 _send(zmq_socket, self.symbol, action_name, price, final_lot,
-                      "", self.__class__._zmq_send_lock)
+                      "", self.__class__._zmq_send_lock,
+                      sl_dist=sl_dist, tp_dist=tp_dist)
 
-                _sync_closed_trades(self.symbol, self._journal, now_utc, kelly)
+                _sync_closed_trades(self.symbol, self._journal, now_utc, kelly,
+                                    sl_tp_opt=sl_tp_opt, regime=_regime)
 
                 _last_signal: dict = {}
                 if action_name in ("LONG", "SHORT"):
                     _side = 1 if action_name == "LONG" else -1
+                    _sl_price = round(price - _side * sl_dist, 5)
+                    _tp_price = round(price + _side * tp_dist, 5)
                     _last_signal = {
                         "side": _side,
                         "price": round(price, 5),
                         "lot": round(final_lot, 2),
-                        "sl": 0.0, "tp": 0.0,
+                        "sl": _sl_price,
+                        "tp": _tp_price,
                         "win_prob": round(win_prob, 4),
                         "z_score": round(z_score, 4),
-                        "rr": 0.0,
+                        "rr": round(tp_dist / max(sl_dist, 1e-9), 2),
                         "timestamp": now_utc.isoformat(),
                     }
                     state_writer.add_signal_to_history(
@@ -607,13 +667,18 @@ class SymbolWorker(threading.Thread):
                         win_prob=win_prob, lot=final_lot, rr=0.0,
                     )
 
+                # Effective fraction = per-symbol fraction × (budget / total equity)
+                # → scales down with N active symbols so dashboard reflects actual exposure
+                _eff_kelly_f = kelly.optimal_fraction() * (
+                    equity_budget / equity if equity > 0 else 1.0
+                )
                 state_writer.update_symbol(
                     symbol=self.symbol,
                     position=0,
                     entry_price=0.0,
                     unrealized_pnl=open_pnl,
                     regime=_regime,
-                    kelly_f=kelly.optimal_fraction() / max(len(_active_syms), 1),
+                    kelly_f=_eff_kelly_f,
                     drawdown_pct=risk_result["total_dd_pct"],
                     last_signal=_last_signal or None,
                 )
@@ -664,7 +729,7 @@ class _StoppableTicks:
         if self._stop.is_set():
             raise StopIteration
         result = next(self._inner)
-        if self._stop.wait(timeout=1.0):
+        if self._stop.is_set():
             raise StopIteration
         return result
 
@@ -674,13 +739,20 @@ class _StoppableTicks:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _send(sock, symbol: str, action: str, price: float, lot: float,
-          reason: str, lock: threading.Lock) -> None:
+          reason: str, lock: threading.Lock,
+          sl_dist: float = 0.0, tp_dist: float = 0.0) -> None:
     import zmq
-    _side_map = {"LONG": 1, "SHORT": -1, "CLOSE": 0, "HOLD": 0}
+    # HOLD = do nothing; EA has no "do nothing" handler and maps side=0 to
+    # CloseAll, so sending HOLD would close any open position every tick.
+    if action == "HOLD":
+        return
+    _side_map = {"LONG": 1, "SHORT": -1, "CLOSE": 0}
     payload = json.dumps({
         "symbol": symbol, "action": action,
-        "side": _side_map.get(action, 0),   # numeric for EA compatibility
+        "side": _side_map.get(action, 0),
         "price": price, "lot": lot, "reason": reason,
+        "sl_dist": round(sl_dist, 5),
+        "tp_dist": round(tp_dist, 5),
         "ts": datetime.now(timezone.utc).isoformat(),
     })
     # EA expects single-frame: "SYMBOL {...json...}" — NOT multipart
@@ -749,7 +821,8 @@ def _close_all_positions(reason: str = "Max DD") -> None:
 _last_deal: dict[str, int] = {}
 
 
-def _sync_closed_trades(symbol: str, journal: TradeJournal, now_utc, kelly=None) -> None:
+def _sync_closed_trades(symbol: str, journal: TradeJournal, now_utc,
+                        kelly=None, sl_tp_opt=None, regime: int = -1) -> None:
     try:
         import MetaTrader5 as mt5
         from datetime import timedelta
@@ -766,7 +839,9 @@ def _sync_closed_trades(symbol: str, journal: TradeJournal, now_utc, kelly=None)
             journal.add_trade(symbol, direction, d.price, d.price, d.volume,
                               t, t, d.profit, d.commission, str(d.ticket))
             if kelly is not None:
-                kelly.record_trade(pnl=d.profit, timestamp=d.time)
+                kelly.record_trade(pnl=d.profit, timestamp=d.time, regime=regime)
+            if sl_tp_opt is not None:
+                sl_tp_opt.record_trade(pnl=d.profit, regime=regime, timestamp=d.time)
             _last_deal[symbol] = d.ticket
     except Exception as exc:
         logger.debug(f"Deal sync {symbol}: {exc}")

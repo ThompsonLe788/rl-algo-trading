@@ -215,6 +215,48 @@ TKAN_HIDDEN_DIM = 64
 TKAN_NUM_CLASSES = 2  # range, trend
 
 # --------------------------------------------------------------------------
+# Kelly / Bayesian risk constants
+# --------------------------------------------------------------------------
+KELLY_PRIOR_ALPHA     = 2.0    # Beta prior α for Bayesian win-rate
+KELLY_PRIOR_BETA      = 2.0    # Beta prior β
+PNL_SCRATCH_THRESHOLD = 0.01   # |pnl| below this → scratch (neither win nor loss)
+DD_TAPER_START_PCT    = 5.0    # drawdown % where Kelly taper begins → 0 at MAX_DRAWDOWN_PCT
+
+# Volatility regime z-score thresholds (hysteresis state machine)
+VOL_REGIME_SPIKE_ENTER    = 2.5   # z > this  → enter spike state  (scalar 0.50×)
+VOL_REGIME_SPIKE_EXIT     = 1.5   # z < this  → drop to elevated
+VOL_REGIME_ELEVATED_ENTER = 1.5   # z > this  → enter elevated     (scalar 0.75×)
+VOL_REGIME_ELEVATED_EXIT  = 0.5   # z < this  → back to normal
+
+# --------------------------------------------------------------------------
+# SL/TP optimizer constants
+# --------------------------------------------------------------------------
+TP_MULT_DEFAULT  = 2.0   # TP = SL × this when no bucket data available
+TP_SAFETY_MARGIN = 1.1   # TP must exceed Kelly break-even R by this factor
+# Win-rate → SL multiplier lookup table (checked top-to-bottom, first match wins)
+# Format: (win_rate_threshold, sl_multiplier)
+SL_ADJ_TABLE: list[tuple[float, float]] = [
+    (0.60, 0.80),   # high accuracy  → tighter stop
+    (0.50, 1.00),   # neutral
+    (0.45, 1.15),
+    (0.40, 1.25),
+    (0.00, 1.50),   # low accuracy   → widen stop (catch-all)
+]
+
+# --------------------------------------------------------------------------
+# News filter
+# --------------------------------------------------------------------------
+NEWS_BLACKOUT_BEFORE_MINS = 15   # block trading N minutes before high-impact news
+NEWS_BLACKOUT_AFTER_MINS  = 10   # block trading N minutes after
+
+# --------------------------------------------------------------------------
+# ZMQ / networking
+# --------------------------------------------------------------------------
+HEARTBEAT_INTERVAL = 5.0    # seconds between Python→EA heartbeat pings
+HEARTBEAT_ENABLED  = False  # set True to send ZMQ heartbeat frames to EA
+SPREAD_SPIKE_MULT  = 3.0    # block entry when spread > this × rolling average
+
+# --------------------------------------------------------------------------
 # Auto-Retrainer
 # --------------------------------------------------------------------------
 

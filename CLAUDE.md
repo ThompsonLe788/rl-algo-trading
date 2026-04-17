@@ -180,6 +180,86 @@ _last_deal[symbol] = max(existing_tickets)
 ### 5. Một mode duy nhất
 `StandardRiskAdapter` + `KillSwitch` là risk layer duy nhất. Không tạo thêm adapter hay mode mới.
 
+### 6. MQL5 files phải đặt đúng thư mục trong MT5
+```
+MQL5\Experts\      ← CHỈ chứa EA (#property script_show_inputs / CTrade)
+  XauDayTrader.mq5
+
+MQL5\Indicators\   ← CHỈ chứa Indicators (#property indicator_chart_window)
+  ATS_Panel.mq5
+  ATS_StrategyView.mq5
+  ATS_SMC.mq5
+```
+- **KHÔNG** đặt indicator vào Experts hoặc ngược lại — MT5 sẽ không load đúng.
+- Sau khi copy file vào đúng thư mục, **bắt buộc recompile** trong MetaEditor (Ctrl+Shift+B).
+- Khi sync từ project → MT5: copy `mt5_bridge/*.mq5` vào đúng thư mục tương ứng, **không copy toàn bộ vào một chỗ**.
+
+### 7. Sau khi edit MQL5 — bắt buộc sync ngay
+```bash
+bash sync_mt5.sh   # copy project → MT5 Experts/ & Indicators/
+```
+- Script này cũng chạy tự động qua **git post-commit hook** (`.git/hooks/post-commit`).
+- Sau sync → recompile MetaEditor (Ctrl+Shift+B) để MT5 load bản mới.
+- **Không edit trực tiếp trong thư mục MT5** — sẽ bị overwrite lần sync tiếp.
+
+---
+
+## Bugs đã fix (lịch sử — không lặp lại)
+
+### Python → EA signal bugs
+```
+BUG:  _send() gửi cả "HOLD" action xuống EA.
+      _side_map["HOLD"] = 0 = _side_map["CLOSE"] → EA gọi CloseAll() mỗi tick PPO output HOLD
+      → position vừa fill xong bị đóng ngay lập tức.
+FIX:  _send() return sớm nếu action == "HOLD". Chỉ gửi LONG / SHORT / CLOSE.
+      File: mt5_bridge/runner.py  hàm _send()
+```
+
+### EA CheckPartialTP — double-close 100% thay vì 50%
+```
+BUG:  Nhiều g_partialTPs records cùng side → cùng tick cả hai đọc curLot cũ
+      → mỗi cái close halfLot → tổng = 100% position bị đóng.
+FIX:  Thêm processedThisTick[100] trong CheckPartialTP().
+      Trước khi close kiểm ticket đã xử lý chưa; sau close ghi vào array.
+      File: mt5_bridge/XauDayTrader.mq5  hàm CheckPartialTP()
+```
+
+### EA Trail luôn 1 ATR từ entry (không phải sau partial TP)
+```
+BUG:  UpdateTrailingStops() trail TẤT CẢ positions từ lúc mở lệnh
+      → SL luôn cách giá 1 ATR, không cho winner chạy.
+FIX:  UpdateTrailingStops() chỉ trail positions đã đăng ký trong g_trails[].
+      Sau khi CheckPartialTP() thực hiện partial close thành công → đăng ký ticket vào g_trails.
+      File: mt5_bridge/XauDayTrader.mq5  hàm UpdateTrailingStops() + CheckPartialTP()
+```
+
+### EA CLOSE signal huỷ pending limit orders
+```
+BUG:  sig.side == 0 → CloseAll() → cancel cả BuyLimit/SellLimit chưa fill.
+      PPO output action=3 (CLOSE) kể cả khi flat → mỗi CLOSE cancel pending limit.
+FIX:  sig.side == 0 → ClosePositionsOnly() (chỉ đóng positions, không cancel pending).
+      Pending orders chỉ bị cancel bởi CancelOppositeOrders() khi signal ngược chiều đến.
+      File: mt5_bridge/XauDayTrader.mq5  hàm ExecuteSignal()
+```
+
+### Kelly edge-decay block trading sau retrain
+```
+BUG:  Sau retrain, _sync_closed_trades() repopulate kelly từ 24h MT5 history
+      → edge-decay của model cũ block model mới.
+FIX:  kelly.reset_history() sau model swap trong AutoRetrainer.
+      _last_deal fast-forward đến max MT5 ticket khi kelly.trade_history rỗng.
+      File: risk/kelly.py  hàm reset_history()
+           mt5_bridge/auto_retrainer.py  sau _backup_and_deploy()
+           mt5_bridge/runner.py  _last_deal fast-forward sau mt5.initialize()
+```
+
+### T-KAN regime=-1 chưa warm up → mở lệnh ngẫu nhiên
+```
+BUG:  Khi regime=-1 (T-KAN chưa đủ data), PPO vẫn infer và gửi LONG/SHORT.
+FIX:  Guard trong SymbolWorker: nếu _regime == -1 → gửi HOLD, bỏ qua inference.
+      File: mt5_bridge/runner.py  SymbolWorker.run()
+```
+
 ---
 
 ## Key files
@@ -188,21 +268,24 @@ _last_deal[symbol] = max(existing_tickets)
 |------|---------|
 | `config.py` | TẤT CẢ tham số — chỉ sửa ở đây |
 | `risk/journal.py` | TradeRecord, TradeJournal — persistent per-symbol |
-| `risk/kelly.py` | KellyPositionSizer (Bayesian, multi-scalar) |
+| `risk/kelly.py` | KellyPositionSizer (Bayesian, multi-scalar) + `reset_history()` |
 | `risk/kill_switch.py` | KillSwitch — circuit breaker |
 | `risk/news_filter.py` | NewsFilter — economic calendar blackout |
+| `risk/sl_tp_optimizer.py` | SL/TP bucket optimizer — regime-aware TP multiplier |
 | `mt5_bridge/runner.py` | SymbolWorker, StandardRiskAdapter, run_multi_live() |
 | `mt5_bridge/signal_server.py` | ZMQ PUB, LiveStateWriter |
-| `mt5_bridge/auto_retrainer.py` | AutoRetrainer — drift detection → PPO retrain |
-| `mt5_bridge/XauDayTrader.mq5` | MQL5 EA: ZMQ SUB, Limit orders, ATR trailing, EOD close |
+| `mt5_bridge/auto_retrainer.py` | AutoRetrainer — drift detection → PPO retrain + kelly.reset_history() |
+| `mt5_bridge/XauDayTrader.mq5` | MQL5 EA: ZMQ SUB, Limit orders, partial TP, trail after TP, EOD close |
 | `mt5_bridge/ATS_Panel.mq5` | MQL5 indicator: live state panel v2.31 |
 | `ai_models/rl_agent.py` | PPO env, Sharpe reward, train_ppo / load_ppo |
 | `ai_models/regime_tkan.py` | T-KAN classifier |
 | `ai_models/features.py` | 24-dim feature vector, OU MLE |
 | `data/pipeline.py` | MT5 fetch, Parquet cache, LiveTickStream |
 | `backtest/walkforward.py` | Walk-forward, TCA |
+| `backtest/validate_models.py` | OOS validation — 5 windows, Sharpe/WR/return pass criteria |
 | `dashboard/app.py` | Streamlit — port 8501 |
 | `retrain_all.py` | Batch retrain T-KAN + PPO cho tất cả symbols |
+| `sync_mt5.sh` | Copy mt5_bridge/*.mq5 → đúng MT5 Experts/ & Indicators/ |
 
 ---
 

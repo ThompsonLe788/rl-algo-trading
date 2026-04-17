@@ -30,14 +30,14 @@ input int      MagicNumberInput  = 0;                      // Magic number (0 = 
 input string   SignalFile        = "";                     // Fallback file (blank = {symbol}_signal.json)
 input int      ZmqRecvTimeoutMs  = 50;                     // ZMQ recv timeout (ms)
 input int      HeartbeatMaxSec   = 30;                     // Max seconds without HB
+input bool     EnableDeadManClose = false;                 // false = block signals only, SL handles risk
 
 //--- Input parameters (trailing stop)
 input double   TrailAtrMult      = 1.0;                    // Trailing stop ATR multiplier
-input bool     EnableTrailingStop = true;                  // Enable dynamic trailing stop
+input bool     EnableTrailingStop = false;                 // Disabled: partial-BE replaces trail
 
-//--- Input parameters (partial TP)
-input bool     EnablePartialTP   = true;                   // Close 50% at TP1, trail rest
-input double   PartialTPAtrMult  = 1.5;                    // TP1 distance = this × ATR
+//--- Input parameters (partial TP / breakeven)
+input bool     EnablePartialTP   = true;                   // At +1R: close 50%, SL → entry
 
 //--- Input parameters (on-chart panel)
 input bool     ShowPanel         = true;                   // Show EA status panel
@@ -87,6 +87,7 @@ Context  g_zmqCtx;
 Socket   g_zmqSub(g_zmqCtx, ZMQ_SUB);
 bool     g_zmqConnected = false;
 datetime g_lastHeartbeat = 0;
+bool     g_deadManTriggered = false;  // prevents log spam every second
 
 //+------------------------------------------------------------------+
 struct SignalData
@@ -95,6 +96,8 @@ struct SignalData
    double price;
    double sl;
    double tp;
+   double sl_dist;    // SL distance in price (from Python SLTPOptimizer)
+   double tp_dist;    // TP distance in price (from Python SLTPOptimizer)
    double lot;
    double win_prob;
    double rr;
@@ -212,9 +215,8 @@ void OnTick()
    if(EnablePartialTP)
       CheckPartialTP();
 
-   //--- Update ATR trailing stop on every tick
-   if(EnableTrailingStop)
-      UpdateTrailingStops();
+   //--- Update ATR trailing stop — only for positions registered after partial TP
+   UpdateTrailingStops();
 }
 
 //+------------------------------------------------------------------+
@@ -224,6 +226,9 @@ void OnTick()
 //+------------------------------------------------------------------+
 void UpdateTrailingStops()
 {
+   //--- Only trail positions registered in g_trails (after partial TP fires)
+   if(g_trailCount <= 0) return;
+
    double atr[];
    if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) <= 0)
       return;
@@ -231,18 +236,25 @@ void UpdateTrailingStops()
    if(atrVal <= 0)
       return;
 
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket))
-         continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-         continue;
+   double mid = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
+                 SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
 
-      double mid   = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
-                      SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
+   for(int ti = g_trailCount - 1; ti >= 0; ti--)
+   {
+      ulong ticket = g_trails[ti].ticket;
+      int   side   = g_trails[ti].side;
+
+      if(!PositionSelectByTicket(ticket))
+      {
+         //--- Position closed — remove from trail list
+         for(int k = ti; k < g_trailCount - 1; k++)
+            g_trails[k] = g_trails[k + 1];
+         g_trailCount--;
+         continue;
+      }
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
       long   type  = PositionGetInteger(POSITION_TYPE);
       double curSL = PositionGetDouble(POSITION_SL);
       double curTP = PositionGetDouble(POSITION_TP);
@@ -250,14 +262,12 @@ void UpdateTrailingStops()
 
       if(type == POSITION_TYPE_BUY)
       {
-         // trail = max(current_sl, mid - mult * ATR)
          double candidate = mid - TrailAtrMult * atrVal;
          if(candidate > curSL + _Point)
             newSL = NormalizeDouble(candidate, _Digits);
       }
       else if(type == POSITION_TYPE_SELL)
       {
-         // trail = min(current_sl, mid + mult * ATR)
          double candidate = mid + TrailAtrMult * atrVal;
          if(curSL <= 0 || candidate < curSL - _Point)
             newSL = NormalizeDouble(candidate, _Digits);
@@ -268,6 +278,8 @@ void UpdateTrailingStops()
          if(!trade.PositionModify(ticket, newSL, curTP))
             Print("TrailingStop modify failed: ", trade.ResultRetcodeDescription(),
                   " ticket=", ticket, " newSL=", newSL);
+         else
+            g_trails[ti].trailLevel = newSL;
       }
    }
 }
@@ -306,10 +318,26 @@ void OnTimer()
       int hbAge = (int)(TimeGMT() - g_lastHeartbeat);
       if(hbAge > HeartbeatMaxSec)
       {
-         Print("DEAD MAN'S SWITCH: No heartbeat for ", hbAge,
-               "s (limit ", HeartbeatMaxSec, "s) — Python is down, closing all positions");
-         CloseAll();
-         return;   // stop processing until Python recovers and sends heartbeat
+         if(!g_deadManTriggered)
+         {
+            if(EnableDeadManClose)
+            {
+               Print("DEAD MAN'S SWITCH: No heartbeat for ", hbAge,
+                     "s — Python is down, closing all positions");
+               CloseAll();
+            }
+            else
+            {
+               Print("DEAD MAN'S SWITCH: No heartbeat for ", hbAge,
+                     "s — Python is down, blocking new signals (SL active)");
+            }
+            g_deadManTriggered = true;
+         }
+         return;   // block new signals until Python recovers
+      }
+      else
+      {
+         g_deadManTriggered = false;   // heartbeat restored — reset flag
       }
    }
 
@@ -383,12 +411,18 @@ void DrainZmqMessages()
 //+------------------------------------------------------------------+
 void ExecuteSignal(const SignalData &sig)
 {
-   //--- Close signal
+   //--- Close signal: close open positions only — do NOT cancel pending limit
+   //    orders. PPO outputs CLOSE even when flat; cancelling pending orders
+   //    would kill the BuyLimit/SellLimit before it fills.
    if(sig.side == 0)
    {
-      CloseAll();
+      ClosePositionsOnly();
       return;
    }
+
+   //--- Cancel pending orders in the OPPOSITE direction before placing a new one
+   //    (e.g. a queued BuyLimit when a fresh SELL signal arrives)
+   CancelOppositeOrders(sig.side);
 
    //--- No new trades after cutoff
    MqlDateTime dt;
@@ -410,53 +444,51 @@ void ExecuteSignal(const SignalData &sig)
    if(lot < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
       return;
 
-   //--- SL/TP from signal or calculate from ATR
-   double sl = sig.sl;
-   double tp = sig.tp;
-   if(sl == 0)
-   {
-      if(sig.side > 0)
-      {
-         sl = sig.price - AtrMultSL * atr[0];
-         tp = sig.price + 2.0 * AtrMultSL * atr[0];
-      }
-      else
-      {
-         sl = sig.price + AtrMultSL * atr[0];
-         tp = sig.price - 2.0 * AtrMultSL * atr[0];
-      }
-   }
-
    //--- Skip if already in position (same direction)
    if(HasPosition(sig.side))
       return;
 
-   //--- Execute LIMIT ORDER only
-   sl    = NormalizeDouble(sl, _Digits);
-   tp    = NormalizeDouble(tp, _Digits);
-   double price = NormalizeDouble(sig.price, _Digits);
-
-   //--- Validate price direction (BuyLimit must be below Ask, SellLimit above Bid)
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // Step 1: Resolve SL/TP distances — prefer signal distances, fallback to ATR
+   double sl_dist, tp_dist;
+   if(sig.sl_dist > 0)
+   {
+      sl_dist = sig.sl_dist;
+      tp_dist = (sig.tp_dist > 0) ? sig.tp_dist : 2.0 * sl_dist;
+   }
+   else
+   {
+      sl_dist = AtrMultSL * atr[0];
+      tp_dist = 2.0 * AtrMultSL * atr[0];
+   }
+
+   // Step 2: Enforce SYMBOL_TRADE_STOPS_LEVEL minimum distance from order price
+   long   stopsPoints = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist     = (stopsPoints + 1) * _Point;
+   sl_dist = MathMax(sl_dist, minDist);
+   tp_dist = MathMax(tp_dist, minDist);
+
+   // Step 3: Adjust limit price into passive zone (BuyLimit < Ask, SellLimit > Bid)
+   double price = NormalizeDouble(sig.price, _Digits);
    if(sig.side > 0 && price >= ask)
-     {
-      // Signal price at or above market — shift to 1 tick below Ask
+   {
       price = NormalizeDouble(ask - _Point, _Digits);
       Print("BuyLimit price adjusted below Ask: ", price, " Ask=", ask);
-     }
+   }
    else if(sig.side < 0 && price <= bid)
-     {
-      // Signal price at or below market — shift to 1 tick above Bid
+   {
       price = NormalizeDouble(bid + _Point, _Digits);
       Print("SellLimit price adjusted above Bid: ", price, " Bid=", bid);
-     }
+   }
 
-   //--- Validate SL on correct side
-   if(sig.side > 0  && sl >= price) sl = NormalizeDouble(price - AtrMultSL * atr[0], _Digits);
-   if(sig.side < 0  && sl <= price) sl = NormalizeDouble(price + AtrMultSL * atr[0], _Digits);
-   if(sig.side > 0  && tp <= price) tp = NormalizeDouble(price + 2.0 * AtrMultSL * atr[0], _Digits);
-   if(sig.side < 0  && tp >= price) tp = NormalizeDouble(price - 2.0 * AtrMultSL * atr[0], _Digits);
+   // Step 4: Compute absolute SL/TP from ADJUSTED price (not stale sig.price)
+   double sl, tp;
+   if(sig.side > 0) { sl = price - sl_dist;  tp = price + tp_dist; }
+   else             { sl = price + sl_dist;  tp = price - tp_dist; }
+   sl = NormalizeDouble(sl, _Digits);
+   tp = NormalizeDouble(tp, _Digits);
 
    bool ok = false;
    if(sig.side > 0)
@@ -487,13 +519,10 @@ void ExecuteSignal(const SignalData &sig)
    //    CheckPartialTP() will match by position ticket when filled.
    if(ok && EnablePartialTP && g_partialTPCount < 99)
    {
-      double atrBuf[];
-      double tp1 = 0;
-      if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuf) > 0)
-         tp1 = price + sig.side * PartialTPAtrMult * atrBuf[0];
-
-      g_partialTPs[g_partialTPCount].ticket      = 0;        // filled after order
-      g_partialTPs[g_partialTPCount].tp1Level     = NormalizeDouble(tp1, _Digits);
+      // tp1Level = 0 sentinel: CheckPartialTP() computes it dynamically
+      // from POSITION_PRICE_OPEN and POSITION_SL once the order fills.
+      g_partialTPs[g_partialTPCount].ticket      = 0;
+      g_partialTPs[g_partialTPCount].tp1Level     = 0;
       g_partialTPs[g_partialTPCount].entryPrice   = price;
       g_partialTPs[g_partialTPCount].origLot      = lot;
       g_partialTPs[g_partialTPCount].partialDone  = false;
@@ -519,6 +548,8 @@ bool ParseSignalJson(const string &json, SignalData &sig)
    sig.price    = JsonGetDouble(json, "price");
    sig.sl       = JsonGetDouble(json, "sl");
    sig.tp       = JsonGetDouble(json, "tp");
+   sig.sl_dist  = JsonGetDouble(json, "sl_dist");
+   sig.tp_dist  = JsonGetDouble(json, "tp_dist");
    sig.lot      = JsonGetDouble(json, "lot");
    sig.win_prob = JsonGetDouble(json, "win_prob");
    sig.rr       = JsonGetDouble(json, "rr");
@@ -533,23 +564,32 @@ bool ParseSignalJson(const string &json, SignalData &sig)
 //+------------------------------------------------------------------+
 bool ReadSignalFromFile(SignalData &sig)
 {
-   int handle = FileOpen(g_effectiveSigFile, FILE_READ | FILE_TXT | FILE_COMMON);
+   // FILE_BIN required — FILE_TXT truncates at '\n', corrupting multi-line JSON
+   int handle = FileOpen(g_effectiveSigFile, FILE_READ | FILE_BIN | FILE_COMMON);
    if(handle == INVALID_HANDLE)
       return false;
 
+   ulong sz = FileSize(handle);
    string content = "";
-   while(!FileIsEnding(handle))
-      content += FileReadString(handle);
+   if(sz > 0)
+   {
+      uchar buf[];
+      ArrayResize(buf, (int)sz);
+      FileReadArray(handle, buf, 0, (int)sz);
+      content = CharArrayToString(buf, 0, (int)sz, CP_UTF8);
+   }
    FileClose(handle);
 
    if(!ParseSignalJson(content, sig))
       return false;
 
-   //--- Clear signal file after reading
-   int wh = FileOpen(g_effectiveSigFile, FILE_WRITE | FILE_TXT | FILE_COMMON);
+   //--- Clear signal file after reading (FILE_BIN write)
+   int wh = FileOpen(g_effectiveSigFile, FILE_WRITE | FILE_BIN | FILE_COMMON);
    if(wh != INVALID_HANDLE)
    {
-      FileWriteString(wh, "{}");
+      uchar empty[];
+      StringToCharArray("{}", empty, 0, -1, CP_UTF8);
+      FileWriteArray(wh, empty, 0, ArraySize(empty) - 1);
       FileClose(wh);
    }
 
@@ -674,6 +714,11 @@ void CheckPartialTP()
    double mid = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
                  SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
 
+   //--- Guard: tickets already closed this tick — prevent double-close when
+   //    multiple g_partialTPs records share the same side (e.g. pyramid entries).
+   ulong processedThisTick[100];
+   int   processedCount = 0;
+
    //--- Match open positions to pending partial-TP records (by side)
    for(int pi = 0; pi < g_partialTPCount; pi++)
    {
@@ -691,13 +736,28 @@ void CheckPartialTP()
          int  posSide = (posType == POSITION_TYPE_BUY) ? 1 : -1;
          if(posSide != g_partialTPs[pi].side) continue;
 
+         //--- Skip if this ticket was already partially closed this tick
+         bool alreadyDone = false;
+         for(int k = 0; k < processedCount; k++)
+            if(processedThisTick[k] == ticket) { alreadyDone = true; break; }
+         if(alreadyDone) break;
+
          //--- Store ticket if not yet linked
          if(g_partialTPs[pi].ticket == 0)
             g_partialTPs[pi].ticket = ticket;
 
+         //--- Compute TP1 dynamically from actual fill price and current SL
+         //    (avoids stale pre-order estimates; works correctly after EA restart)
+         double posEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+         double posSL    = PositionGetDouble(POSITION_SL);
+         if(posSL <= 0) break;                      // SL not set yet — skip
+         double r1 = MathAbs(posEntry - posSL);
+         if(r1 < _Point) break;                     // degenerate — skip
+
+         double tp1 = NormalizeDouble(posEntry + posSide * r1, _Digits);
+
          //--- Check if TP1 hit
-         bool tp1Hit = (posSide > 0) ? (mid >= g_partialTPs[pi].tp1Level)
-                                     : (mid <= g_partialTPs[pi].tp1Level);
+         bool tp1Hit = (posSide > 0) ? (mid >= tp1) : (mid <= tp1);
          if(!tp1Hit) break;
 
          //--- Close 50% of remaining lot
@@ -717,10 +777,14 @@ void CheckPartialTP()
          if(closed)
          {
             Print("PartialTP: closed ", halfLot, " lots at ", DoubleToString(mid, _Digits),
-                  " TP1=", DoubleToString(g_partialTPs[pi].tp1Level, _Digits));
+                  " TP1=", DoubleToString(tp1, _Digits));
 
-            //--- Move SL to breakeven for the remaining 50%
-            double be = NormalizeDouble(g_partialTPs[pi].entryPrice, _Digits);
+            //--- Mark ticket as processed this tick to prevent double-close
+            if(processedCount < 100)
+               processedThisTick[processedCount++] = ticket;
+
+            //--- Move SL to breakeven — use actual fill price, not pending order price
+            double be = NormalizeDouble(posEntry, _Digits);
             double curTP = PositionGetDouble(POSITION_TP);
             // Re-select because partial close may have refreshed the position
             if(PositionSelectByTicket(ticket))
@@ -732,6 +796,31 @@ void CheckPartialTP()
                   trade.PositionModify(ticket, newSL, curTP);
                else if(posSide < 0 && (existSL <= 0 || newSL < existSL))
                   trade.PositionModify(ticket, newSL, curTP);
+            }
+
+            //--- Register in g_trails so UpdateTrailingStops() trails remaining 50%
+            double atr[];
+            double atrVal = 0;
+            if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) > 0) atrVal = atr[0];
+            if(atrVal > 0 && g_trailCount < 100)
+            {
+               // Initial trail level: breakeven ± TrailAtrMult*ATR (locks in some profit)
+               double initTrail = (posSide > 0)
+                  ? NormalizeDouble(be + posSide * TrailAtrMult * atrVal, _Digits)
+                  : NormalizeDouble(be + posSide * TrailAtrMult * atrVal, _Digits);
+               // Only register if initTrail is better than breakeven
+               bool alreadyRegistered = false;
+               for(int t = 0; t < g_trailCount; t++)
+                  if(g_trails[t].ticket == ticket) { alreadyRegistered = true; break; }
+               if(!alreadyRegistered)
+               {
+                  g_trails[g_trailCount].ticket     = ticket;
+                  g_trails[g_trailCount].trailLevel = initTrail;
+                  g_trails[g_trailCount].side       = posSide;
+                  g_trailCount++;
+                  Print("Trail registered after partial TP: ticket=", ticket,
+                        " initTrail=", DoubleToString(initTrail, _Digits));
+               }
             }
          }
          g_partialTPs[pi].partialDone = true;
@@ -750,6 +839,39 @@ void CheckPartialTP()
 }
 
 //+------------------------------------------------------------------+
+//--- Close open positions only; leave pending limit orders intact.
+//    Used for PPO CLOSE signal — Python may send CLOSE while flat, and
+//    cancelling a pending BuyLimit/SellLimit would prevent the intended fill.
+void ClosePositionsOnly()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      trade.PositionClose(PositionGetTicket(i));
+   }
+   g_partialTPCount = 0;
+   g_trailCount     = 0;
+}
+
+//--- Cancel pending orders in the direction OPPOSITE to newSide.
+//    Called before placing a new signal so stale opposite-direction limits are removed.
+void CancelOppositeOrders(int newSide)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+      long ot = OrderGetInteger(ORDER_TYPE);
+      bool isBuy  = (ot == ORDER_TYPE_BUY_LIMIT  || ot == ORDER_TYPE_BUY_STOP);
+      bool isSell = (ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP);
+      if(newSide > 0 && isSell) trade.OrderDelete(ticket);
+      if(newSide < 0 && isBuy)  trade.OrderDelete(ticket);
+   }
+}
+
 void CloseAll()
 {
    //--- Close positions
@@ -769,8 +891,9 @@ void CloseAll()
       trade.OrderDelete(ticket);
    }
 
-   //--- Clear partial TP state
+   //--- Clear partial TP state and trail state
    g_partialTPCount = 0;
+   g_trailCount     = 0;
 }
 
 //+------------------------------------------------------------------+

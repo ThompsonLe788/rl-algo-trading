@@ -675,12 +675,13 @@ class SymbolWorker(threading.Thread):
                 tp_mult     = sl_tp_opt.get_tp_mult(_regime, now_utc.hour)
                 tp_dist     = tick_atr * tp_mult
 
-                # ── Step 2: Gate CLOSE on confirmed MT5 position ───────────
-                # PPO fires action=3 (CLOSE) even when flat because position
-                # state is missing from obs. Only forward CLOSE when MT5
-                # confirms an open position — prevents phantom closes.
-                if action_name == "CLOSE" and current_mt5_position == 0:
-                    action_name = "HOLD"
+                # ── Step 2: Gate CLOSE — only exit profitable positions ────
+                # - No position: ignore CLOSE (PPO fires it when flat)
+                # - Position losing (upnl < 0): SL handles it, Python stays out
+                # - Position profitable (upnl >= 0): allow PPO exit to lock profit
+                if action_name == "CLOSE":
+                    if current_mt5_position == 0 or mt5_upnl < 0:
+                        action_name = "HOLD"
 
                 _send(zmq_socket, self.symbol, action_name, price, final_lot,
                       "", self.__class__._zmq_send_lock,

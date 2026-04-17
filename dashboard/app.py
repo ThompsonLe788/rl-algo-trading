@@ -311,7 +311,7 @@ def _z_chart(sym: str, history: list) -> "go.Figure | None":
 
 # ─── Main dashboard (fragment = smooth partial refresh, no page flicker) ──────
 
-@st.fragment(run_every=5)
+@st.fragment(run_every=2)
 def _dashboard() -> None:
     # ── Session state ─────────────────────────────────────────────────────────
     if "equity_history" not in st.session_state:
@@ -334,7 +334,7 @@ def _dashboard() -> None:
     tab_symbols       = sorted(active_charts) if active_charts else sorted(set(state.symbols) | set(worker_status))
     all_known_symbols = sorted(set(state.symbols) | set(worker_status))  # System tab history
     now_utc           = datetime.now(timezone.utc)
-    ts_str            = now_utc.strftime("%H:%M:%S")
+    ts_str            = now_utc.strftime("%H:%M:%S UTC")
 
     if state.equity > 0:
         st.session_state.equity_history.append((ts_str, state.equity))
@@ -530,7 +530,7 @@ def _dashboard() -> None:
                     tick_age = int((now_utc - ts_dt).total_seconds())
                     tick_str = f"{tick_age}s ago"
                 except Exception:
-                    tick_str = tick_ts[:19].replace("T", " ")
+                    tick_str = tick_ts[:19].replace("T", " ") + " UTC"
             else:
                 tick_str = "—"
 
@@ -657,7 +657,7 @@ def _dashboard() -> None:
                 rr_v    = float(sig_data.get("rr", 0.0))
                 reg_v   = {1: "TREND", 0: "RANGE", -1: "—"}.get(
                     sig_data.get("regime", -1), "—")
-                sig_ts  = (sig_data.get("timestamp", "")[:19].replace("T", " ")
+                sig_ts  = (sig_data.get("timestamp", "")[:19].replace("T", " ") + " UTC"
                            if sig_data.get("timestamp") else "—")
 
                 st.markdown(f"""

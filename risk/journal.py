@@ -3,12 +3,16 @@
 Thread-safe log of closed trades. Written on every closed deal and
 reloaded on restart to seed Kelly trade history and last-deal tracking.
 
+Primary storage : JSON (atomic write via .tmp → rename)
+Analytics mirror: SQLite with WAL mode (read-only from dashboard)
+
 TradeRecord  — one closed trade (dataclass)
-TradeJournal — thread-safe JSON + CSV persistent log
+TradeJournal — thread-safe JSON + SQLite persistent log
 """
 import csv
 import json
 import logging
+import sqlite3
 import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -90,6 +94,8 @@ class TradeJournal:
         self._lock   = threading.Lock()
         self._trades: list[TradeRecord] = []
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_path = self._path.with_suffix(".db")
+        self._db_init()
         self._load()
 
     def add_trade(
@@ -114,6 +120,7 @@ class TradeJournal:
         with self._lock:
             self._trades.append(record)
         self._save()
+        self._db_insert(record)
         logger.info(
             f"[Journal] {record.symbol} {record.direction.upper()} "
             f"{record.lot_size} lot  net={record.net_pnl:+.2f} USD"
@@ -188,6 +195,76 @@ class TradeJournal:
         logger.info(f"[Journal] Exported {len(trades)} trades to {path}")
         return path
 
+    # ── SQLite WAL mirror ────────────────────────────────────────────────────
+
+    def _db_init(self) -> None:
+        """Create SQLite DB with WAL mode for concurrent read access."""
+        try:
+            con = sqlite3.connect(str(self._db_path))
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    trade_id    TEXT PRIMARY KEY,
+                    trade_date  TEXT,
+                    symbol      TEXT,
+                    direction   TEXT,
+                    open_time   TEXT,
+                    close_time  TEXT,
+                    open_price  REAL,
+                    close_price REAL,
+                    lot_size    REAL,
+                    pnl_usd     REAL,
+                    commission  REAL,
+                    net_pnl     REAL
+                )
+            """)
+            con.commit()
+            con.close()
+        except Exception as exc:
+            logger.warning("[Journal] SQLite init error: %s", exc)
+
+    def _db_insert(self, record: TradeRecord) -> None:
+        """Insert one trade into SQLite (idempotent — IGNORE on duplicate PK)."""
+        try:
+            con = sqlite3.connect(str(self._db_path))
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("""
+                INSERT OR IGNORE INTO trades VALUES (
+                    ?,?,?,?,?,?,?,?,?,?,?,?
+                )
+            """, (
+                record.trade_id, record.trade_date, record.symbol, record.direction,
+                record.open_time, record.close_time,
+                record.open_price, record.close_price, record.lot_size,
+                record.pnl_usd, record.commission, record.net_pnl,
+            ))
+            con.commit()
+            con.close()
+        except Exception as exc:
+            logger.warning("[Journal] SQLite insert error: %s", exc)
+
+    def _db_bulk_sync(self, trades: list[TradeRecord]) -> None:
+        """Sync all trades to SQLite (used after JSON load on startup)."""
+        try:
+            con = sqlite3.connect(str(self._db_path))
+            con.execute("PRAGMA journal_mode=WAL")
+            con.executemany("""
+                INSERT OR IGNORE INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [
+                (t.trade_id, t.trade_date, t.symbol, t.direction,
+                 t.open_time, t.close_time,
+                 t.open_price, t.close_price, t.lot_size,
+                 t.pnl_usd, t.commission, t.net_pnl)
+                for t in trades
+            ])
+            con.commit()
+            con.close()
+        except Exception as exc:
+            logger.warning("[Journal] SQLite bulk sync error: %s", exc)
+
+    # ── JSON persistence ─────────────────────────────────────────────────────
+
     def _save(self) -> None:
         try:
             tmp = self._path.with_suffix(".tmp")
@@ -206,6 +283,7 @@ class TradeJournal:
             if isinstance(raw, list):
                 self._trades = [TradeRecord(**r) for r in raw]
                 logger.info(f"[Journal] Loaded {len(self._trades)} trades from {self._path}")
+                self._db_bulk_sync(self._trades)
         except Exception as exc:
             logger.warning(f"[Journal] Load error (starting fresh): {exc}")
             self._trades = []

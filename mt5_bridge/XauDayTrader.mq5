@@ -23,7 +23,7 @@ input bool     UseZmq            = true;                   // true=ZMQ, false=fi
 input double   RiskFractionKelly = 0.1;                    // Kelly fraction (1/10)
 input int      EodHourGMT        = 22;                     // Hard liquidation hour
 input int      NoNewTradesHour   = 21;                     // No new trades after this
-input double   AtrMultSL         = 1.5;                    // ATR multiplier for SL
+input double   AtrMultSL         = 2.0;                    // ATR multiplier for SL
 input double   MaxDrawdownPct    = 15.0;                   // Kill switch drawdown %
 input int      AtrPeriod         = 14;                     // ATR calculation period
 input int      MagicNumberInput  = 0;                      // Magic number (0 = auto from symbol)
@@ -300,13 +300,16 @@ void OnTimer()
       return;
    }
 
-   //--- 3. Heartbeat watchdog (ZMQ only)
+   //--- 3. Dead man's switch: close all if Python heartbeat lost
    if(g_zmqConnected && HeartbeatMaxSec > 0)
    {
-      if((int)(TimeGMT() - g_lastHeartbeat) > HeartbeatMaxSec)
+      int hbAge = (int)(TimeGMT() - g_lastHeartbeat);
+      if(hbAge > HeartbeatMaxSec)
       {
-         Print("WARNING: No heartbeat for ", (int)(TimeGMT() - g_lastHeartbeat),
-               "s — Python publisher may be down");
+         Print("DEAD MAN'S SWITCH: No heartbeat for ", hbAge,
+               "s (limit ", HeartbeatMaxSec, "s) — Python is down, closing all positions");
+         CloseAll();
+         return;   // stop processing until Python recovers and sends heartbeat
       }
    }
 

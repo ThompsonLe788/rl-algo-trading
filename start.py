@@ -48,6 +48,84 @@ info = lambda s: print(f"       {s}")
 # Pre-flight checks
 # ---------------------------------------------------------------------------
 
+def check_python_version() -> bool:
+    major, minor = sys.version_info[:2]
+    if (major, minor) < (3, 11):
+        fail(f"Python {major}.{minor} detected — requires 3.11+")
+        return False
+    ok(f"Python {major}.{minor}")
+    return True
+
+
+def check_config() -> bool:
+    """Validate critical config values are within safe ranges."""
+    from config import (
+        MAX_DRAWDOWN_PCT, DAILY_LOSS_LIMIT_PCT, MAX_RISK_PER_TRADE,
+        KELLY_FRACTION, EOD_HOUR_GMT, LOG_DIR, MODEL_DIR, DATA_DIR,
+    )
+    passed = True
+
+    # Risk parameter sanity
+    if MAX_DRAWDOWN_PCT <= 0 or MAX_DRAWDOWN_PCT > 50:
+        fail(f"MAX_DRAWDOWN_PCT={MAX_DRAWDOWN_PCT}% out of range (0–50)")
+        passed = False
+    if DAILY_LOSS_LIMIT_PCT <= 0 or DAILY_LOSS_LIMIT_PCT >= MAX_DRAWDOWN_PCT:
+        fail(f"DAILY_LOSS_LIMIT_PCT={DAILY_LOSS_LIMIT_PCT}% must be < MAX_DRAWDOWN_PCT={MAX_DRAWDOWN_PCT}%")
+        passed = False
+    if MAX_RISK_PER_TRADE <= 0 or MAX_RISK_PER_TRADE > 0.10:
+        fail(f"MAX_RISK_PER_TRADE={MAX_RISK_PER_TRADE} out of range (0–10%)")
+        passed = False
+    if KELLY_FRACTION <= 0 or KELLY_FRACTION > 0.5:
+        fail(f"KELLY_FRACTION={KELLY_FRACTION} out of range (0–0.5)")
+        passed = False
+    if EOD_HOUR_GMT < 18 or EOD_HOUR_GMT > 23:
+        warn(f"EOD_HOUR_GMT={EOD_HOUR_GMT} — unusual (typical 21–23)")
+
+    # Directory writability
+    for d in (LOG_DIR, MODEL_DIR, DATA_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+        except Exception as e:
+            fail(f"Directory not writable: {d} — {e}")
+            passed = False
+
+    # Disk space: warn if < 1 GB free
+    try:
+        import shutil as _sh
+        free_gb = _sh.disk_usage(LOG_DIR).free / 1e9
+        if free_gb < 1.0:
+            warn(f"Low disk space: {free_gb:.1f} GB free (recommended ≥ 1 GB)")
+        else:
+            ok(f"Config validated  |  Disk: {free_gb:.1f} GB free")
+    except Exception:
+        ok("Config validated")
+
+    return passed
+
+
+def check_zmq_port() -> bool:
+    """Verify the ZMQ port is not already bound by another process."""
+    import socket
+    from config import ZMQ_SIGNAL_ADDR
+    # Parse port from tcp://127.0.0.1:5555
+    try:
+        port = int(ZMQ_SIGNAL_ADDR.rsplit(":", 1)[-1])
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            result = s.connect_ex(("127.0.0.1", port))
+        if result == 0:
+            warn(f"ZMQ port {port} is already in use — another runner may be running")
+            return False
+        ok(f"ZMQ port {port} available")
+        return True
+    except Exception as e:
+        warn(f"ZMQ port check failed: {e}")
+        return True   # non-fatal
+
+
 def check_deps() -> bool:
     required = ["zmq", "stable_baselines3", "gymnasium", "torch",
                 "pandas", "numpy", "streamlit"]
@@ -77,7 +155,15 @@ def check_mt5() -> bool:
         mt5.shutdown()
         ok(f"MetaTrader 5 connected ({term.name})")
         if acc:
-            ok(f"Account #{acc.login}  balance=${acc.balance:,.2f}  equity=${acc.equity:,.2f}")
+            acc_type = "DEMO" if acc.trade_mode == 0 else "LIVE"
+            balance_str = f"${acc.balance:,.2f}"
+            ok(f"Account #{acc.login}  [{acc_type}]  balance={balance_str}  equity=${acc.equity:,.2f}")
+            if acc.trade_mode != 0:
+                warn("LIVE account detected — ensure risk parameters are correct before trading")
+            if acc.leverage > 2000:
+                warn(f"Leverage 1:{acc.leverage} — extremely high, verify Kelly fraction")
+            elif acc.leverage < 50:
+                warn(f"Leverage 1:{acc.leverage} — low leverage, lot sizes may be very small")
         return True
     except ImportError:
         warn("MetaTrader5 package not installed")
@@ -171,9 +257,17 @@ def main():
     print(f"  ATS Multi-Symbol Trading System")
     print(f"{'='*55}{RESET}\n")
 
+    if not check_python_version():
+        sys.exit(1)
+
     if not check_deps():
         sys.exit(1)
 
+    if not check_config():
+        fail("Config validation failed — fix config.py before starting")
+        sys.exit(1)
+
+    check_zmq_port()
     mt5_ok = check_mt5()
 
     if not args.dashboard_only:

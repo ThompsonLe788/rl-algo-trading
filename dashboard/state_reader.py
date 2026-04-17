@@ -74,20 +74,34 @@ class LiveState:
         return self.system.get("last_heartbeat", "")
 
 
+_state_cache: dict = {"mtime": 0.0, "state": None}
+
+
 def read_state(path: Path | None = None) -> LiveState:
-    """Read and parse live_state.json. Returns empty LiveState on any read failure."""
+    """Read and parse live_state.json.
+
+    Uses mtime-based caching: returns the cached LiveState if the file has not
+    changed since the last read, avoiding redundant I/O on every 2-second poll.
+    Returns empty LiveState on any read failure.
+    """
     path = path or LIVE_STATE_PATH
+    try:
+        mtime = path.stat().st_mtime
+        if mtime == _state_cache["mtime"] and _state_cache["state"] is not None:
+            return _state_cache["state"]
+    except OSError:
+        return LiveState()
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return LiveState()
     except json.JSONDecodeError as exc:
         log.warning("state_reader: JSON decode error in %s: %s", path, exc)
-        return LiveState()
+        return _state_cache["state"] or LiveState()   # return last good state
     except OSError as exc:
-        # Windows file lock or permission error during concurrent write
         log.warning("state_reader: OS error reading %s: %s", path, exc)
-        return LiveState()
+        return _state_cache["state"] or LiveState()
     except Exception as exc:
         log.warning("state_reader: unexpected error reading %s: %s", path, exc)
         return LiveState()
@@ -108,12 +122,15 @@ def read_state(path: Path | None = None) -> LiveState:
             timestamp=val.get("timestamp", ""),
         )
 
-    return LiveState(
+    result = LiveState(
         symbols=symbols,
         account=raw.get("_account", {}),
         system=raw.get("_system", {}),
         updated_at=time.time(),
     )
+    _state_cache["mtime"] = mtime
+    _state_cache["state"] = result
+    return result
 
 
 def read_worker_status() -> dict[str, str]:

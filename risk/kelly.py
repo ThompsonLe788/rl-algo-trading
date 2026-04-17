@@ -12,10 +12,12 @@ Features:
 - Streak dampener: reduces size on losing streaks
 - Margin-aware: respects broker margin requirements
 - Per-symbol JSON persistence for restart recovery
+- Portfolio Kelly: correlation-adjusted equity allocation across symbols
 """
 import json
 import logging
 import math
+import threading
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -390,6 +392,155 @@ class KellyPositionSizer:
             "streak_scalar": round(self._streak_scalar(), 4),
             "vol_regime_scalar": round(self._vol_regime_scalar(), 4),
             "edge_alive": self.recent_edge_alive,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Portfolio Kelly — correlation-adjusted multi-symbol equity allocation
+# ---------------------------------------------------------------------------
+
+class PortfolioKellyAllocator:
+    """Singleton that allocates account equity across active symbols using the
+    inverse correlation matrix (Portfolio Kelly).
+
+    When symbols trade independently (ρ≈0), each gets equity/N — identical to
+    the naive split.  When two symbols are correlated (e.g. XAUUSD & GBPUSD
+    both move on USD news), the inverse-correlation weights automatically reduce
+    the budget of the correlated pair, capping total portfolio risk.
+
+    Math:
+        R  = (N × T) return matrix, one row per symbol
+        C  = corrcoef(R) + ε·I   (regularised correlation matrix)
+        w  = C⁻¹ · 1  /  (1ᵀ · C⁻¹ · 1)   (max-diversification weights)
+        budget_i = equity × w_i
+
+    Negative weights are floored to 0 and renormalised, so a strongly anti-
+    correlated symbol still gets a small positive allocation.
+
+    Usage (thread-safe singleton):
+        alloc = PortfolioKellyAllocator.instance()
+        alloc.update_return("XAUUSD", ret)          # call each tick
+        budget = alloc.equity_budget("XAUUSD", equity, active_symbols)
+    """
+
+    RETURN_WINDOW     = 60    # rolling bars of returns per symbol
+    MIN_OBS           = 20    # fall back to equity/N if fewer observations
+    REGULARISE        = 0.05  # diagonal regularisation (ε) to avoid singularity
+    HIGH_CORR_WARN    = 0.70  # log warning when any pair exceeds this
+
+    _instance: "PortfolioKellyAllocator | None" = None
+    _cls_lock = threading.Lock()
+
+    @classmethod
+    def instance(cls) -> "PortfolioKellyAllocator":
+        if cls._instance is None:
+            with cls._cls_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def __init__(self) -> None:
+        self._returns: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    # ── data feed ────────────────────────────────────────────────────────────
+
+    def update_return(self, symbol: str, ret: float) -> None:
+        """Feed one tick/bar return (price change / previous price)."""
+        with self._lock:
+            if symbol not in self._returns:
+                self._returns[symbol] = deque(maxlen=self.RETURN_WINDOW)
+            if np.isfinite(ret):
+                self._returns[symbol].append(ret)
+
+    # ── allocation ───────────────────────────────────────────────────────────
+
+    def equity_budget(
+        self,
+        symbol: str,
+        total_equity: float,
+        active_symbols: list[str],
+    ) -> float:
+        """Return the equity budget for *symbol* after correlation adjustment.
+
+        Falls back to total_equity / N when:
+        - only one symbol is active
+        - fewer than MIN_OBS returns are available for any symbol
+        - the correlation matrix is numerically singular
+        """
+        n = len(active_symbols)
+        if n <= 1:
+            return total_equity
+
+        fallback = total_equity / n
+
+        with self._lock:
+            if not all(
+                sym in self._returns and len(self._returns[sym]) >= self.MIN_OBS
+                for sym in active_symbols
+            ):
+                return fallback
+
+            min_len = min(len(self._returns[s]) for s in active_symbols)
+            R = np.array([list(self._returns[s])[-min_len:] for s in active_symbols], dtype=float)
+
+            try:
+                C = np.corrcoef(R)
+                C = C + np.eye(n) * self.REGULARISE   # regularise
+
+                # Warn on high pairwise correlations
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if abs(C[i, j]) >= self.HIGH_CORR_WARN:
+                            logger.warning(
+                                "High correlation %.2f between %s and %s — "
+                                "portfolio Kelly reducing allocation",
+                                C[i, j], active_symbols[i], active_symbols[j],
+                            )
+
+                C_inv = np.linalg.inv(C)
+                ones  = np.ones(n)
+                raw_w = C_inv @ ones             # unnormalised weights
+                total_w = ones @ raw_w
+                if total_w <= 0:
+                    return fallback
+
+                weights = raw_w / total_w        # normalise → sum to 1
+                weights = np.maximum(weights, 0.0)   # floor negatives
+                s = weights.sum()
+                if s <= 0:
+                    return fallback
+                weights /= s                     # renormalise after floor
+
+                idx = active_symbols.index(symbol)
+                return float(total_equity * weights[idx])
+
+            except (np.linalg.LinAlgError, ValueError, IndexError):
+                return fallback
+
+    # ── diagnostics ──────────────────────────────────────────────────────────
+
+    def correlation_matrix(self, symbols: list[str]) -> np.ndarray | None:
+        """Return the current NxN correlation matrix, or None if insufficient data."""
+        with self._lock:
+            if not all(
+                sym in self._returns and len(self._returns[sym]) >= self.MIN_OBS
+                for sym in symbols
+            ):
+                return None
+            min_len = min(len(self._returns[s]) for s in symbols)
+            R = np.array([list(self._returns[s])[-min_len:] for s in symbols], dtype=float)
+            return np.corrcoef(R)
+
+    def weights(self, active_symbols: list[str]) -> dict[str, float]:
+        """Return current allocation weights as a dict (sums to 1.0)."""
+        n = len(active_symbols)
+        if n == 0:
+            return {}
+        dummy_eq = 1.0
+        return {
+            sym: self.equity_budget(sym, dummy_eq, active_symbols)
+            for sym in active_symbols
         }
 
 

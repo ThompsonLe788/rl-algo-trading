@@ -208,19 +208,24 @@ class SymbolWorker(threading.Thread):
 
     @classmethod
     def active_count(cls) -> int:
-        """Number of workers currently in 'live' state.
-
-        Only live workers contribute to the equity budget split — workers
-        that are loading, waiting, or in error don't consume a slot yet.
-        Falls back to the raw _active_count when no worker is live (e.g.
-        during the very first startup before any worker reaches live status).
-        """
+        """Number of workers currently in 'live' state."""
         with cls._status_lock:
             live = sum(1 for s in cls._status.values() if s == "live")
         if live > 0:
             return live
         with cls._active_lock:
             return max(1, cls._active_count)
+
+    @classmethod
+    def active_symbols(cls) -> list[str]:
+        """List of symbols whose worker is in 'live' state (used by Portfolio Kelly)."""
+        with cls._status_lock:
+            live = [s for s, st in cls._status.items() if st == "live"]
+        if live:
+            return live
+        # During startup before any worker goes live, return all registered symbols
+        with cls._status_lock:
+            return list(cls._status.keys()) or ["UNKNOWN"]
 
     def __init__(
         self,
@@ -303,8 +308,9 @@ class SymbolWorker(threading.Thread):
             from config import EOD_HOUR_GMT, get_symbol_config
             from mt5_bridge.signal_server import LiveStateWriter
             # Initialize kelly early so it's never unbound in any code path
-            from risk.kelly import KellyPositionSizer
+            from risk.kelly import KellyPositionSizer, PortfolioKellyAllocator
             kelly = KellyPositionSizer(symbol=self.symbol)
+            _portfolio_alloc = PortfolioKellyAllocator.instance()
 
             sym_cfg = get_symbol_config(self.symbol)
             news    = NewsFilter()
@@ -498,11 +504,25 @@ class SymbolWorker(threading.Thread):
                     )
                     kelly.set_regime(_regime)
                     kelly.update_rvol(tick_atr)
-                    # Divide equity by N active symbols so total exposure
-                    # stays within single-symbol risk budget
-                    n_active  = self.__class__.active_count()
+
+                    # Feed tick return to Portfolio Kelly allocator
+                    if len(tick_df) >= 2:
+                        _prev = float(tick_df["close"].iloc[-2])
+                        _curr = float(tick_df["close"].iloc[-1])
+                        if _prev > 0:
+                            _portfolio_alloc.update_return(
+                                self.symbol, (_curr - _prev) / _prev
+                            )
+
+                    # Correlation-adjusted equity budget (falls back to equity/N
+                    # when < 20 observations or only one symbol active)
+                    _active_syms = self.__class__.active_symbols()
+                    equity_budget = _portfolio_alloc.equity_budget(
+                        self.symbol, equity, _active_syms
+                    )
+
                     kelly_lot = kelly.calc_lot_size(
-                        account_equity=equity / n_active,
+                        account_equity=equity_budget,
                         entry_price=mid_price,
                         sl_distance=max(sl_dist, 1e-6),
                     )
@@ -593,7 +613,7 @@ class SymbolWorker(threading.Thread):
                     entry_price=0.0,
                     unrealized_pnl=open_pnl,
                     regime=_regime,
-                    kelly_f=kelly.optimal_fraction() / n_active,
+                    kelly_f=kelly.optimal_fraction() / max(len(_active_syms), 1),
                     drawdown_pct=risk_result["total_dd_pct"],
                     last_signal=_last_signal or None,
                 )
@@ -656,9 +676,11 @@ class _StoppableTicks:
 def _send(sock, symbol: str, action: str, price: float, lot: float,
           reason: str, lock: threading.Lock) -> None:
     import zmq
+    _side_map = {"LONG": 1, "SHORT": -1, "CLOSE": 0, "HOLD": 0}
     payload = json.dumps({
-        "symbol": symbol, "action": action, "price": price,
-        "lot": lot, "reason": reason,
+        "symbol": symbol, "action": action,
+        "side": _side_map.get(action, 0),   # numeric for EA compatibility
+        "price": price, "lot": lot, "reason": reason,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
     # EA expects single-frame: "SYMBOL {...json...}" — NOT multipart

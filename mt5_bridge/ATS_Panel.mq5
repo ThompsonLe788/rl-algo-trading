@@ -12,7 +12,7 @@
 //| Data source : ats_live_state.json  (Python LiveStateWriter)      |
 //+------------------------------------------------------------------+
 #property copyright "ATS"
-#property version   "2.20"
+#property version   "2.30"
 #property indicator_chart_window
 #property indicator_plots 0
 
@@ -49,6 +49,13 @@ struct PanelData
    double equity;
    double balance;
    double acct_drawdown;
+   double daily_loss_usd;
+   double max_loss_usd;
+   double profit_usd;
+   double daily_loss_limit_usd;
+   double max_loss_limit_usd;
+   double profit_target_usd;
+   double initial_balance;
    // _system
    bool   system_alive;
    bool   system_killed;
@@ -188,6 +195,7 @@ string _JsonString(const string &j, const string &key)
    if(p < 0) return "";
    p += StringLen(s);
    while(p < StringLen(j) && StringGetCharacter(j, p) == ' ') p++;
+   if(StringSubstr(j, p, 4) == "null") return "";   // handle JSON null
    if(StringGetCharacter(j, p) != '"') return "";
    p++;
    string v = "";
@@ -299,9 +307,16 @@ void _LoadState()
    string acct = _JsonObject(content, "_account");
    if(StringLen(acct) > 0)
    {
-      g_pd.equity        = _JsonDouble(acct, "equity");
-      g_pd.balance       = _JsonDouble(acct, "balance");
-      g_pd.acct_drawdown = _JsonDouble(acct, "drawdown_pct");
+      g_pd.equity               = _JsonDouble(acct, "equity");
+      g_pd.balance              = _JsonDouble(acct, "balance");
+      g_pd.acct_drawdown        = _JsonDouble(acct, "drawdown_pct");
+      g_pd.daily_loss_usd       = _JsonDouble(acct, "daily_loss_usd");
+      g_pd.max_loss_usd         = _JsonDouble(acct, "max_loss_usd");
+      g_pd.profit_usd           = _JsonDouble(acct, "profit_usd");
+      g_pd.daily_loss_limit_usd = _JsonDouble(acct, "daily_loss_limit_usd");
+      g_pd.max_loss_limit_usd   = _JsonDouble(acct, "max_loss_limit_usd");
+      g_pd.profit_target_usd    = _JsonDouble(acct, "profit_target_usd");
+      g_pd.initial_balance      = _JsonDouble(acct, "initial_balance");
    }
    // _system
    string sys = _JsonObject(content, "_system");
@@ -581,6 +596,51 @@ void _DrawPanel()
    ty += LH;
    _T("rsk_eq_l", "Equity    :", lx,   ty, ClrLabel);  _T("rsk_eq_v", DoubleToString(g_pd.equity,  2), vx,   ty, ClrValueNeutral);
    _T("rsk_bl_l", "Balance :",  c2lx,  ty, ClrLabel);  _T("rsk_bl_v", DoubleToString(g_pd.balance, 2), c2vx, ty, ClrValueNeutral);
+   ty += LH;
+
+   // Acct DD: pct + dollar amount
+   string ddPctS = DoubleToString(g_pd.acct_drawdown, 2) + "%";
+   string ddUsdS = g_pd.max_loss_usd > 0 ? "  ($" + DoubleToString(g_pd.max_loss_usd, 0) + ")" : "";
+   color  ddC    = g_pd.acct_drawdown >= 8.0 ? ClrValueNeg
+                 : g_pd.acct_drawdown >= 5.0 ? clrOrange : ClrValueNeutral;
+   _T("rsk_dd_l", "Acct DD   :", lx, ty, ClrLabel);
+   _T("rsk_dd_v", ddPctS + ddUsdS, vx, ty, ddC);
+   ty += LH;
+
+   // Daily Loss: current vs limit
+   bool   hasDL    = g_pd.daily_loss_limit_usd > 0;
+   string dlCurS   = "$" + DoubleToString(g_pd.daily_loss_usd, 0);
+   string dlLimS   = hasDL ? " / $" + DoubleToString(g_pd.daily_loss_limit_usd, 0) : "";
+   color  dlC      = (hasDL && g_pd.daily_loss_usd >= g_pd.daily_loss_limit_usd * 0.8)
+                   ? ClrValueNeg
+                   : (hasDL && g_pd.daily_loss_usd >= g_pd.daily_loss_limit_usd * 0.5)
+                   ? clrOrange : ClrValueNeutral;
+   _T("rsk_dl_l", "Daily Loss:", lx, ty, ClrLabel);
+   _T("rsk_dl_v", dlCurS + dlLimS, vx, ty, dlC);
+   ty += LH;
+
+   // Max Loss: current vs limit
+   bool   hasML    = g_pd.max_loss_limit_usd > 0;
+   string mlCurS   = "$" + DoubleToString(g_pd.max_loss_usd, 0);
+   string mlLimS   = hasML ? " / $" + DoubleToString(g_pd.max_loss_limit_usd, 0) : "";
+   color  mlC      = (hasML && g_pd.max_loss_usd >= g_pd.max_loss_limit_usd * 0.8)
+                   ? ClrValueNeg
+                   : (hasML && g_pd.max_loss_usd >= g_pd.max_loss_limit_usd * 0.5)
+                   ? clrOrange : ClrValueNeutral;
+   _T("rsk_ml_l", "Max Loss  :", lx, ty, ClrLabel);
+   _T("rsk_ml_v", mlCurS + mlLimS, vx, ty, mlC);
+   ty += LH;
+
+   // Profit: current vs target
+   bool   hasPT    = g_pd.profit_target_usd > 0;
+   string ptCurS   = "$" + DoubleToString(g_pd.profit_usd, 0);
+   string ptTgtS   = hasPT ? " / $" + DoubleToString(g_pd.profit_target_usd, 0) : "";
+   color  ptC      = (hasPT && g_pd.profit_usd >= g_pd.profit_target_usd)
+                   ? ClrValuePos
+                   : (hasPT && g_pd.profit_usd >= g_pd.profit_target_usd * 0.5)
+                   ? clrYellow : ClrValueNeutral;
+   _T("rsk_pt_l", "Profit    :", lx, ty, ClrLabel);
+   _T("rsk_pt_v", ptCurS + ptTgtS, vx, ty, ptC);
    ty += LH;
 
    _DrawSep("4", ty); ty += LH_DIV;

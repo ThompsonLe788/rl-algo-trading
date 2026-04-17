@@ -177,27 +177,49 @@ class NewsFilter:
 
     # ── public API ────────────────────────────────────────────────────────────
 
+    # Swap rollover: forex brokers charge 3× swap on Wednesday at 22:00 UTC.
+    # Block new trades from 21:45 to 22:15 UTC on Wednesday to avoid overnight
+    # swap charges on positions opened just before rollover.
+    SWAP_BLOCK_DAY      = 2          # Wednesday (Mon=0)
+    SWAP_ROLLOVER_HOUR  = 22         # 22:00 UTC
+    SWAP_PRE_MINUTES    = 15         # block 15 min before
+    SWAP_POST_MINUTES   = 15         # block 15 min after
+
     def is_blackout(
         self,
         now: datetime | None = None,
         currencies: list[str] | None = None,
+        check_swap: bool = True,
     ) -> tuple[bool, str]:
-        """Return (True, event_name) if now is within any blackout window.
+        """Return (True, reason) if now is within any blackout window.
+
+        Checks:
+        1. Economic calendar events (± pre/post window)
+        2. Wednesday 3× swap rollover window (21:45–22:15 UTC)
 
         Args:
-            now:        UTC datetime to check (defaults to datetime.now(utc)).
-            currencies: Optional filter — only check events for these currencies.
-                        ``None`` checks all events.
+            now:         UTC datetime to check (defaults to datetime.now(utc)).
+            currencies:  Optional filter — only check events for these currencies.
+            check_swap:  Whether to include the Wednesday swap blackout.
         """
         if now is None:
             now = datetime.now(timezone.utc)
-        # Ensure tz-aware
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
 
+        # ── Wednesday 3× swap rollover window ───────────────────────────────
+        if check_swap and now.weekday() == self.SWAP_BLOCK_DAY:
+            rollover = now.replace(
+                hour=self.SWAP_ROLLOVER_HOUR, minute=0, second=0, microsecond=0
+            )
+            swap_start = rollover - timedelta(minutes=self.SWAP_PRE_MINUTES)
+            swap_end   = rollover + timedelta(minutes=self.SWAP_POST_MINUTES)
+            if swap_start <= now <= swap_end:
+                return True, "Swap3x-Wed"
+
+        # ── Economic calendar events ─────────────────────────────────────────
         for event in self._events:
             try:
-                # Currency filter
                 if currencies:
                     ev_currencies = event.get("currencies", [])
                     if ev_currencies and not any(c in ev_currencies for c in currencies):

@@ -18,6 +18,104 @@ from config import DATA_DIR, SYMBOL
 logger = logging.getLogger("data_pipeline")
 
 
+class DataQualityError(ValueError):
+    """Raised when fetched OHLC data fails quality checks."""
+
+
+def validate_ohlc(
+    df: pd.DataFrame,
+    symbol: str,
+    requested_bars: int = 0,
+    max_stale_hours: float = 4.0,
+    min_fill_ratio: float = 0.5,
+) -> pd.DataFrame:
+    """Validate and clean OHLC data returned by copy_rates_from_pos.
+
+    Checks performed (in order):
+    1. Minimum bar count  — at least min_fill_ratio × requested_bars rows
+    2. Staleness          — last bar must be within max_stale_hours of now
+    3. Duplicate timestamps — deduplicated (keep last)
+    4. OHLC integrity     — high >= max(open,close), low <= min(open,close)
+    5. Zero-price rows    — removed (occur on instrument roll / broker error)
+
+    Args:
+        df:              Raw DataFrame with DatetimeIndex and OHLC columns.
+        symbol:          Symbol name for log messages.
+        requested_bars:  Original num_bars request; 0 disables fill-ratio check.
+        max_stale_hours: How old the last bar can be before raising DataQualityError.
+                         Use 48+ for instruments that close at weekends (crypto 0).
+        min_fill_ratio:  Minimum fraction of requested bars that must be present.
+
+    Returns:
+        Cleaned DataFrame (same schema).
+
+    Raises:
+        DataQualityError: if any non-recoverable quality issue is found.
+    """
+    if df is None or df.empty:
+        raise DataQualityError(f"[{symbol}] Empty DataFrame from MT5")
+
+    original_len = len(df)
+
+    # ── 1. Minimum bar count ────────────────────────────────────────────────
+    if requested_bars > 0:
+        min_bars = int(requested_bars * min_fill_ratio)
+        if original_len < min_bars:
+            raise DataQualityError(
+                f"[{symbol}] Only {original_len} bars returned "
+                f"(requested {requested_bars}, min {min_bars})"
+            )
+
+    # ── 2. Staleness ────────────────────────────────────────────────────────
+    last_ts = df.index[-1]
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.tz_localize("UTC")
+    now_utc = datetime.now(timezone.utc)
+    age_hours = (now_utc - last_ts.to_pydatetime()).total_seconds() / 3600
+    if age_hours > max_stale_hours:
+        raise DataQualityError(
+            f"[{symbol}] Last bar is {age_hours:.1f}h old "
+            f"(limit {max_stale_hours}h) — possible stale feed or market closed"
+        )
+
+    # ── 3. Duplicate timestamps ─────────────────────────────────────────────
+    n_dupes = df.index.duplicated().sum()
+    if n_dupes:
+        logger.warning("[%s] %d duplicate timestamps removed", symbol, n_dupes)
+        df = df[~df.index.duplicated(keep="last")]
+
+    # ── 4. Zero-price rows ──────────────────────────────────────────────────
+    zero_mask = (df["close"] <= 0) | (df["open"] <= 0)
+    n_zero = zero_mask.sum()
+    if n_zero:
+        logger.warning("[%s] %d zero-price rows removed", symbol, n_zero)
+        df = df[~zero_mask]
+
+    # ── 5. OHLC integrity ───────────────────────────────────────────────────
+    bad_hl = df["high"] < df["low"]
+    n_bad = bad_hl.sum()
+    if n_bad:
+        logger.warning("[%s] %d rows with high < low — clamping", symbol, n_bad)
+        df.loc[bad_hl, "high"] = df.loc[bad_hl, ["open", "close", "high"]].max(axis=1)
+        df.loc[bad_hl, "low"]  = df.loc[bad_hl, ["open", "close", "low"]].min(axis=1)
+
+    # Recompute mid after cleaning
+    if "mid" in df.columns:
+        df = df.copy()
+        df["mid"] = (df["high"] + df["low"]) / 2
+
+    cleaned_len = len(df)
+    if cleaned_len < original_len:
+        logger.info(
+            "[%s] Data quality: %d → %d rows after cleaning",
+            symbol, original_len, cleaned_len,
+        )
+    else:
+        logger.debug("[%s] Data quality OK (%d bars, age %.1fh)", symbol, cleaned_len, age_hours)
+
+    return df
+
+
 def fetch_mt5_ohlc(
     symbol: str = SYMBOL,
     timeframe: str = "M1",
@@ -56,7 +154,7 @@ def fetch_mt5_ohlc(
         mt5.shutdown()
 
     if rates is None or len(rates) == 0:
-        raise ValueError(f"No data returned for {symbol}")
+        raise DataQualityError(f"[{symbol}] No data returned from MT5")
 
     df = pd.DataFrame(rates)
     df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
@@ -64,7 +162,11 @@ def fetch_mt5_ohlc(
     df = df[["datetime", "open", "high", "low", "close", "volume"]]
     df["mid"] = (df["high"] + df["low"]) / 2
     df = df.set_index("datetime")
-    return df
+
+    # Staleness check is relaxed for historical range requests (start/end provided)
+    stale_limit = 4.0 if not (start and end) else 24.0 * 365 * 10
+    return validate_ohlc(df, symbol, requested_bars=num_bars if not (start and end) else 0,
+                         max_stale_hours=stale_limit)
 
 
 def fetch_mt5_ticks(
@@ -145,7 +247,15 @@ def load_or_fetch(
         age_hours = (_time.time() - path.stat().st_mtime) / 3600.0
         if age_hours <= max_cache_hours:
             logger.info(f"Loading cached {path} (age {age_hours:.1f}h)")
-            return pd.read_parquet(path)
+            df_cached = pd.read_parquet(path)
+            try:
+                # Validate cache integrity but skip staleness (file age already checked)
+                df_cached = validate_ohlc(df_cached, symbol, max_stale_hours=24.0 * 365 * 10)
+            except DataQualityError as _qe:
+                logger.warning(f"Cached data failed quality check ({_qe}) — re-fetching")
+                path.unlink(missing_ok=True)
+            else:
+                return df_cached
         logger.info(f"Cache {path} is {age_hours:.1f}h old (> {max_cache_hours}h) — refreshing")
 
     logger.info(f"Fetching {symbol} {timeframe} from MT5...")

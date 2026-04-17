@@ -742,11 +742,12 @@ def _send(sock, symbol: str, action: str, price: float, lot: float,
           reason: str, lock: threading.Lock,
           sl_dist: float = 0.0, tp_dist: float = 0.0) -> None:
     import zmq
-    # HOLD = do nothing; EA has no "do nothing" handler and maps side=0 to
-    # CloseAll, so sending HOLD would close any open position every tick.
-    if action == "HOLD":
+    # Python only places entries — exits are managed by EA (SL/TP/EOD/partial TP).
+    # HOLD: nothing to do.
+    # CLOSE: EA handles all exits; Python must not interfere.
+    if action in ("HOLD", "CLOSE"):
         return
-    _side_map = {"LONG": 1, "SHORT": -1, "CLOSE": 0}
+    _side_map = {"LONG": 1, "SHORT": -1}
     payload = json.dumps({
         "symbol": symbol, "action": action,
         "side": _side_map.get(action, 0),

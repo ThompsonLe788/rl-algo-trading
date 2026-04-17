@@ -39,6 +39,7 @@ input bool     EnableTrailingStop = false;                 // Disabled: partial-
 //--- Input parameters (partial TP / breakeven)
 input bool     EnablePartialTP   = true;                   // At +1R: close 50%, SL → entry
 
+
 //--- Input parameters (on-chart panel)
 input bool     ShowPanel         = true;                   // Show EA status panel
 input int      PanelX            = 5;                      // Panel right margin (px)
@@ -411,23 +412,22 @@ void DrainZmqMessages()
 //+------------------------------------------------------------------+
 void ExecuteSignal(const SignalData &sig)
 {
-   //--- Close signal: close open positions only — do NOT cancel pending limit
-   //    orders. PPO outputs CLOSE even when flat; cancelling pending orders
-   //    would kill the BuyLimit/SellLimit before it fills.
-   if(sig.side == 0)
-   {
-      ClosePositionsOnly();
-      return;
-   }
+   //--- Python only sends LONG(+1) / SHORT(-1). side=0 is ignored — EA manages
+   //    all exits via SL, TP, partial TP, trailing stop, and EOD CloseAll().
+   if(sig.side == 0) return;
 
-   //--- Cancel pending orders in the OPPOSITE direction before placing a new one
-   //    (e.g. a queued BuyLimit when a fresh SELL signal arrives)
-   CancelOppositeOrders(sig.side);
+   //--- New signal: cancel ALL pending orders (both directions) to replace with fresh price.
+   //    Filled positions are NOT touched — they run to SL/TP.
+   CancelPendingOrders(sig.side);
 
    //--- No new trades after cutoff
    MqlDateTime dt;
    TimeGMT(dt);
    if(dt.hour >= NoNewTradesHour)
+      return;
+
+   //--- Skip if already in a FILLED position same direction (don't pyramid)
+   if(HasFilledPosition(sig.side))
       return;
 
    //--- Calculate ATR
@@ -442,10 +442,6 @@ void ExecuteSignal(const SignalData &sig)
 
    lot = NormalizeLot(lot);
    if(lot < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
-      return;
-
-   //--- Skip if already in position (same direction)
-   if(HasPosition(sig.side))
       return;
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -840,8 +836,8 @@ void CheckPartialTP()
 
 //+------------------------------------------------------------------+
 //--- Close open positions only; leave pending limit orders intact.
-//    Used for PPO CLOSE signal — Python may send CLOSE while flat, and
-//    cancelling a pending BuyLimit/SellLimit would prevent the intended fill.
+//    NOT called from Python signals (Python only sends LONG/SHORT).
+//    Reserved for future internal EA use if needed.
 void ClosePositionsOnly()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -854,9 +850,12 @@ void ClosePositionsOnly()
    g_trailCount     = 0;
 }
 
-//--- Cancel pending orders in the direction OPPOSITE to newSide.
-//    Called before placing a new signal so stale opposite-direction limits are removed.
-void CancelOppositeOrders(int newSide)
+//--- Cancel ALL pending limit/stop orders for this symbol.
+//    Called when a new entry signal arrives — pending orders get replaced with
+//    fresh price. Filled positions are never touched here.
+//    Also cleans up g_partialTPs records that were linked to cancelled orders
+//    (ticket==0 means the limit never filled).
+void CancelPendingOrders(int newSide)
 {
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
@@ -865,11 +864,39 @@ void CancelOppositeOrders(int newSide)
       if(OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
       if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
       long ot = OrderGetInteger(ORDER_TYPE);
-      bool isBuy  = (ot == ORDER_TYPE_BUY_LIMIT  || ot == ORDER_TYPE_BUY_STOP);
-      bool isSell = (ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP);
-      if(newSide > 0 && isSell) trade.OrderDelete(ticket);
-      if(newSide < 0 && isBuy)  trade.OrderDelete(ticket);
+      bool isPending = (ot == ORDER_TYPE_BUY_LIMIT  || ot == ORDER_TYPE_BUY_STOP ||
+                        ot == ORDER_TYPE_SELL_LIMIT || ot == ORDER_TYPE_SELL_STOP);
+      if(!isPending) continue;
+      // Determine side of the pending order
+      bool isBuy = (ot == ORDER_TYPE_BUY_LIMIT || ot == ORDER_TYPE_BUY_STOP);
+      int  cancelledSide = isBuy ? 1 : -1;
+      trade.OrderDelete(ticket);
+      // Remove unlinked g_partialTPs records for this side (ticket==0 = never filled)
+      int newCount = 0;
+      for(int pi = 0; pi < g_partialTPCount; pi++)
+      {
+         bool isZombie = (g_partialTPs[pi].side == cancelledSide &&
+                          g_partialTPs[pi].ticket == 0 &&
+                          !g_partialTPs[pi].partialDone);
+         if(!isZombie) g_partialTPs[newCount++] = g_partialTPs[pi];
+      }
+      g_partialTPCount = newCount;
    }
+}
+
+//--- Returns true only if there is a FILLED (open) position in this direction.
+//    Pending limit orders are NOT counted — they can be replaced by new signals.
+bool HasFilledPosition(int side)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      long posType = PositionGetInteger(POSITION_TYPE);
+      if(side > 0 && posType == POSITION_TYPE_BUY)  return true;
+      if(side < 0 && posType == POSITION_TYPE_SELL) return true;
+   }
+   return false;
 }
 
 void CloseAll()

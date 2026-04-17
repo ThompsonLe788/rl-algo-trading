@@ -14,17 +14,26 @@ Commands:
 Alerts (auto-push every 10s diff):
   KILL SWITCH activated
   Trade opened / closed
-  Drawdown > 5% warning
+  Drawdown > daily loss limit warning
   Heartbeat lost > 45s
+  Daily PnL summary at 22:00 UTC
+  Drift detection triggered
+  Model swap (new model accepted or rejected)
 """
 import asyncio
 import logging
 import os
+from pathlib import Path
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import DAILY_LOSS_LIMIT_PCT
 from dashboard.state_reader import read_state, LiveState, SymbolState
 
 from telegram import Update
@@ -36,10 +45,18 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
+dotenv_path = Path(__file__).parent.parent / ".env"
+if load_dotenv and dotenv_path.exists():
+    load_dotenv(dotenv_path)
+
 TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-POLL_INTERVAL = 10  # seconds between state diffs
-HB_WARN_SEC   = 45  # warn if heartbeat older than this
+POLL_INTERVAL = 10   # seconds between state diffs
+HB_WARN_SEC   = 45   # warn if heartbeat older than this
+EOD_SUMMARY_HOUR_UTC = 22   # send daily P&L summary at this UTC hour
+
+# Path to signal_server.log for model-swap / drift detection scanning
+_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "signal_server.log")
 
 
 # ---------------------------------------------------------------------------
@@ -73,38 +90,58 @@ def _age_seconds(iso_ts: str) -> float:
 # Alert diffing
 # ---------------------------------------------------------------------------
 
+def _tail_log(path: str, lines: int = 200) -> list[str]:
+    """Return last `lines` lines of a log file (best-effort)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk = min(size, lines * 150)
+            f.seek(max(0, size - chunk))
+            data = f.read()
+        return data.decode("utf-8", errors="replace").splitlines()[-lines:]
+    except Exception:
+        return []
+
+
 class AlertDiffer:
     """Track previous state to detect changes worth alerting."""
 
     def __init__(self):
         self._prev: LiveState | None = None
-        self._hb_warned = False   # suppress repeated HB warnings
+        self._hb_warned = False                   # suppress repeated HB warnings
+        self._last_summary_day: int = -1          # day-of-year for daily summary
+        self._equity_at_session_open: float = 0.0 # for daily P&L calc
+        self._last_log_size: int = 0              # for log scanning (drift/swap)
 
     def diff(self, cur: LiveState) -> list[str]:
         """Return list of alert message strings (may be empty)."""
         if self._prev is None:
             self._prev = cur
+            self._equity_at_session_open = cur.equity
             return []
 
         alerts: list[str] = []
         prev = self._prev
+        now = datetime.now(timezone.utc)
 
-        # Kill switch transition
+        # ── Kill switch transition ──────────────────────────────────────────
         if cur.is_killed and not prev.is_killed:
             reason = cur.system.get("kill_reason", "")
             alerts.append(
-                f"\U0001f534 *KILL SWITCH* activated\\!\n"
-                f"Drawdown: {cur.drawdown_pct:.1f}%"
-                + (f"\nReason: {reason}" if reason else "")
+                "\U0001f534 *KILL SWITCH* activated\\!\n"
+                f"Drawdown: {_md(f'{cur.drawdown_pct:.1f}%')}"
+                + (f"\nReason: {_md(reason)}" if reason else "")
             )
 
-        # Drawdown warning (crosses 5%)
-        if cur.drawdown_pct >= 5.0 and prev.drawdown_pct < 5.0:
+        # ── Drawdown warning (crosses DAILY_LOSS_LIMIT_PCT) ─────────────────
+        if cur.drawdown_pct >= DAILY_LOSS_LIMIT_PCT and prev.drawdown_pct < DAILY_LOSS_LIMIT_PCT:
             alerts.append(
-                f"\u26a0\ufe0f Daily drawdown {cur.drawdown_pct:.1f}% — approaching kill limit"
+                f"\u26a0\ufe0f Daily drawdown {_md(f'{cur.drawdown_pct:.1f}%')} "
+                f"\u2014 approaching kill limit"
             )
 
-        # Per-symbol position changes
+        # ── Per-symbol position changes ─────────────────────────────────────
         all_syms = set(cur.symbols) | set(prev.symbols)
         for sym in all_syms:
             c = cur.symbols.get(sym)
@@ -112,34 +149,114 @@ class AlertDiffer:
             c_pos = c.position if c else 0
             p_pos = p.position if p else 0
 
-            # Position opened
             if c_pos != 0 and p_pos == 0 and c:
                 side = c.position_str
                 lots = c.last_signal.get("lot", "?")
                 price = c.entry_price or c.last_signal.get("price", 0)
                 alerts.append(
-                    f"\U0001f7e2 *Trade opened*: `{sym}` {side} {lots} lots @ {price:.5g}"
+                    f"\U0001f7e2 *Trade opened*: `{_md(sym)}` {_md(side)} "
+                    f"{_md(str(lots))} lots @ {_md(f'{price:.5g}')}"
                 )
 
-            # Position closed
             elif c_pos == 0 and p_pos != 0 and p:
                 pnl = p.unrealized_pnl
+                icon = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
                 alerts.append(
-                    f"\u26aa *Trade closed*: `{sym}` {_fmt_pnl(pnl)}"
+                    f"{icon} *Trade closed*: `{_md(sym)}` {_md(_fmt_pnl(pnl))}"
                 )
 
-        # Heartbeat lost
+        # ── Heartbeat lost ──────────────────────────────────────────────────
         hb_age = _age_seconds(cur.last_heartbeat)
         if hb_age > HB_WARN_SEC and not self._hb_warned:
             alerts.append(
-                f"\u26a0\ufe0f Heartbeat lost for {int(hb_age)}s — "
-                f"Python publisher may be down"
+                f"\u26a0\ufe0f Heartbeat lost for {_md(str(int(hb_age)))}s \u2014 "
+                "Python publisher may be down"
             )
             self._hb_warned = True
         elif hb_age <= HB_WARN_SEC:
-            self._hb_warned = False  # reset
+            self._hb_warned = False
+
+        # ── Daily P&L summary at EOD ────────────────────────────────────────
+        today_doy = now.timetuple().tm_yday
+        if (
+            now.hour == EOD_SUMMARY_HOUR_UTC
+            and today_doy != self._last_summary_day
+            and cur.equity > 0
+        ):
+            self._last_summary_day = today_doy
+            daily_pnl = cur.equity - self._equity_at_session_open
+            daily_pct = (daily_pnl / (self._equity_at_session_open + 1e-9)) * 100
+            icon = "\U0001f4c8" if daily_pnl >= 0 else "\U0001f4c9"
+            lines = [
+                f"{icon} *Daily P&L Summary* \\({_md(now.strftime('%Y\\-%m\\-%d'))}\\)",
+                f"P&L: {_md(_fmt_pnl(daily_pnl))} \\({_md(f'{daily_pct:+.2f}%')}\\)",
+                f"Equity: {_md(f'${cur.equity:,.2f}')}",
+                f"Drawdown: {_md(f'{cur.drawdown_pct:.2f}%')}",
+                f"Signals: {_md(str(cur.signal_count))}",
+            ]
+            # Per-symbol summary
+            for sym, s in sorted(cur.symbols.items()):
+                regime = _md(s.regime_str)
+                lines.append(f"  `{_md(sym)}` regime={regime} pos={_md(s.position_str)}")
+            alerts.append("\n".join(lines))
+            # Reset session-open equity for next day
+            self._equity_at_session_open = cur.equity
+
+        # ── Drift detection + model swap alerts from log ────────────────────
+        alerts.extend(self._scan_log_alerts())
 
         self._prev = cur
+        return alerts
+
+    def _scan_log_alerts(self) -> list[str]:
+        """Scan last lines of signal_server.log for drift/swap events."""
+        alerts: list[str] = []
+        try:
+            import os as _os
+            size = _os.path.getsize(_LOG_PATH)
+        except Exception:
+            return alerts
+
+        if size <= self._last_log_size:
+            return alerts                           # nothing new
+
+        new_lines = _tail_log(_LOG_PATH, lines=50)
+        self._last_log_size = size
+
+        for line in new_lines:
+            if "drift_detected" in line and "AutoRetrain START" in line:
+                # Extract symbol if possible
+                sym = ""
+                if "[" in line:
+                    try:
+                        sym = line.split("[")[1].split("]")[0]
+                    except Exception:
+                        pass
+                alerts.append(
+                    f"\U0001f9e0 *Drift detected* on `{_md(sym)}`\n"
+                    "AutoRetrainer triggered — retraining in background"
+                )
+            elif "New model ACCEPTED" in line:
+                sym = ""
+                if "[" in line:
+                    try:
+                        sym = line.split("[")[1].split("]")[0]
+                    except Exception:
+                        pass
+                alerts.append(
+                    f"\u2705 *Model swap* `{_md(sym)}` \u2014 new model ACCEPTED and deployed"
+                )
+            elif "New model REJECTED" in line:
+                sym = ""
+                if "[" in line:
+                    try:
+                        sym = line.split("[")[1].split("]")[0]
+                    except Exception:
+                        pass
+                alerts.append(
+                    f"\u274c *Model swap* `{_md(sym)}` \u2014 new model REJECTED, keeping current"
+                )
+
         return alerts
 
 
@@ -167,15 +284,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hb_age = _age_seconds(state.last_heartbeat)
     hb_str = _md(f"{int(hb_age)}s ago") if hb_age < float("inf") else "unknown"
 
-    text = (
-        f"*System:* {badge}\n"
-        f"*Equity:* {_md(f'${state.equity:,.2f}')}\n"
-        f"*Balance:* {_md(f'${state.balance:,.2f}')}\n"
-        f"*Drawdown:* {_md(f'{state.drawdown_pct:.2f}%')}\n"
-        f"*Signals:* {state.signal_count}\n"
-        f"*Heartbeat:* {hb_str}"
-    )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    lines = [
+        f"*System:* {badge}",
+        f"*Equity:* {_md(f'${state.equity:,.2f}')}",
+        f"*Balance:* {_md(f'${state.balance:,.2f}')}",
+        f"*Drawdown:* {_md(f'{state.drawdown_pct:.2f}%')}",
+        f"*Signals:* {state.signal_count}",
+        f"*Heartbeat:* {hb_str}",
+    ]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,7 +369,49 @@ async def _on_startup(app: Application):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _acquire_bot_lock() -> bool:
+    """Single-instance guard — prevents duplicate Telegram bot processes."""
+    import atexit
+    import subprocess as _sp
+
+    lock = Path(__file__).resolve().parent.parent / "logs" / "telegram_bot.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, AttributeError):
+            pass
+        try:
+            out = _sp.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stderr=_sp.DEVNULL,
+            ).decode(errors="replace")
+            return str(pid) in out
+        except Exception:
+            return False
+
+    if lock.exists():
+        try:
+            existing_pid = int(lock.read_text().strip())
+            if _pid_alive(existing_pid):
+                logger.warning(
+                    f"Telegram bot already running (PID {existing_pid}). Exiting."
+                )
+                return False
+        except ValueError:
+            pass
+
+    lock.write_text(str(os.getpid()))
+    atexit.register(lambda: lock.unlink(missing_ok=True))
+    return True
+
+
 def main():
+    if not _acquire_bot_lock():
+        return
+
     if not TOKEN:
         raise RuntimeError(
             "TELEGRAM_TOKEN env var not set. "

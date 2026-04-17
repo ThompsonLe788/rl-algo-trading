@@ -31,8 +31,12 @@ def fetch_mt5_ohlc(
     """
     import MetaTrader5 as mt5
 
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    # Only initialize (and later shut down) if MT5 is not already running.
+    # Multi-symbol parallel callers must not shutdown each other's session.
+    already_running = mt5.terminal_info() is not None
+    if not already_running:
+        if not mt5.initialize():
+            raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
     tf_map = {
         "M1": mt5.TIMEFRAME_M1,
@@ -48,7 +52,8 @@ def fetch_mt5_ohlc(
     else:
         rates = mt5.copy_rates_from_pos(symbol, tf, 0, num_bars)
 
-    mt5.shutdown()
+    if not already_running:
+        mt5.shutdown()
 
     if rates is None or len(rates) == 0:
         raise ValueError(f"No data returned for {symbol}")
@@ -71,8 +76,10 @@ def fetch_mt5_ticks(
     """Fetch tick data from MetaTrader 5."""
     import MetaTrader5 as mt5
 
-    if not mt5.initialize():
-        raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    already_running = mt5.terminal_info() is not None
+    if not already_running:
+        if not mt5.initialize():
+            raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
 
     if start and end:
         ticks = mt5.copy_ticks_range(symbol, start, end, mt5.COPY_TICKS_ALL)
@@ -84,7 +91,8 @@ def fetch_mt5_ticks(
             mt5.COPY_TICKS_ALL,
         )
 
-    mt5.shutdown()
+    if not already_running:
+        mt5.shutdown()
 
     if ticks is None or len(ticks) == 0:
         raise ValueError(f"No ticks returned for {symbol}")
@@ -118,19 +126,27 @@ def load_or_fetch(
     timeframe: str = "M1",
     num_bars: int = 100_000,
     force_refresh: bool = False,
+    max_cache_hours: float = 24.0,
 ) -> pd.DataFrame:
     """Load from cache or fetch from MT5.
 
     Cache file name is derived from symbol + timeframe if name is not given:
       XAUUSD + M1  → xauusd_m1.parquet
       EURUSD + M5  → eurusd_m5.parquet
+
+    max_cache_hours: if cached file is older than this, force a refresh.
+      Default 24h — prevents auto-training on stale data across day boundaries.
     """
+    import time as _time
     if name is None:
         name = f"{symbol.lower()}_{timeframe.lower()}"
     path = DATA_DIR / f"{name}.parquet"
     if path.exists() and not force_refresh:
-        logger.info(f"Loading cached {path}")
-        return pd.read_parquet(path)
+        age_hours = (_time.time() - path.stat().st_mtime) / 3600.0
+        if age_hours <= max_cache_hours:
+            logger.info(f"Loading cached {path} (age {age_hours:.1f}h)")
+            return pd.read_parquet(path)
+        logger.info(f"Cache {path} is {age_hours:.1f}h old (> {max_cache_hours}h) — refreshing")
 
     logger.info(f"Fetching {symbol} {timeframe} from MT5...")
     df = fetch_mt5_ohlc(symbol, timeframe, num_bars=num_bars)

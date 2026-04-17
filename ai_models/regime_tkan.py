@@ -135,12 +135,110 @@ class TKAN(nn.Module):
             return F.softmax(logits, dim=-1).cpu().numpy().squeeze()
 
 
+def _adx(df: "pd.DataFrame", window: int = 14) -> "pd.Series":
+    """Average Directional Index (Wilder smoothing).
+
+    Returns a Series in [0, 100].  ADX > 25 = trending.
+    """
+    import pandas as pd
+    high = df["high"]
+    low  = df["low"]
+    close_prev = df["close"].shift(1)
+
+    tr  = pd.concat([
+        high - low,
+        (high - close_prev).abs(),
+        (low  - close_prev).abs(),
+    ], axis=1).max(axis=1)
+
+    plus_dm  = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    # Only keep the larger DM; set the other to 0
+    cond = plus_dm >= minus_dm
+    plus_dm[~cond]  = 0.0
+    minus_dm[cond]  = 0.0
+
+    # Wilder smoothing (α = 1/window)
+    alpha = 1.0 / window
+    atr_s   = tr.ewm(alpha=alpha, adjust=False).mean()
+    pdm_s   = plus_dm.ewm(alpha=alpha, adjust=False).mean()
+    mdm_s   = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+
+    pdi = 100.0 * pdm_s / (atr_s + 1e-9)
+    mdi = 100.0 * mdm_s / (atr_s + 1e-9)
+    dx  = 100.0 * (pdi - mdi).abs() / (pdi + mdi + 1e-9)
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+    return adx
+
+
+def _fractal_efficiency_ratio(mid: "pd.Series", window: int = 20) -> "pd.Series":
+    """Fractal Efficiency Ratio (FER).
+
+    FER = |Price(t) - Price(t-N)| / Σ|ΔPrice| over N bars.
+
+    Range [0, 1].  FER near 1 → directionally efficient (trending).
+    FER near 0 → choppy / mean-reverting.
+    """
+    net_move   = (mid - mid.shift(window)).abs()
+    path_len   = mid.diff().abs().rolling(window, min_periods=window).sum() + 1e-9
+    return (net_move / path_len).clip(0.0, 1.0)
+
+
+def _hurst_variance_ratio(mid: "pd.Series", short: int = 5, long: int = 20) -> "pd.Series":
+    """Simplified variance-ratio Hurst estimate.
+
+    VR = Var(r_long) / (k * Var(r_short)),  k = long/short
+    H ≈ 0.5 * log2(VR + 1e-9) / log2(k)
+
+    H > 0.55 → persistent (trending)
+    H < 0.45 → anti-persistent (mean-reverting)
+    Returns H estimate in [0, 1].
+    """
+    import numpy as np
+    r_s = mid.pct_change(short)
+    r_l = mid.pct_change(long)
+    var_s = r_s.rolling(long * 4, min_periods=long).var() + 1e-12
+    var_l = r_l.rolling(long * 4, min_periods=long).var() + 1e-12
+    k = long / short
+    vr = var_l / (k * var_s)
+    h = 0.5 * np.log2(vr.clip(lower=1e-9)) / np.log2(k)
+    return h.clip(0.0, 1.0).fillna(0.5)
+
+
 def label_regimes(df, atr_window: int = 14, threshold: float = 1.5) -> np.ndarray:
-    """Heuristic labeling: trend if directional move > threshold * ATR, else range."""
+    """Multi-signal regime labeling: trend (1) or range (0).
+
+    Three independent signals vote; majority (≥ 2 of 3) wins:
+      1. ADX > 25                            (trend strength)
+      2. Fractal Efficiency Ratio > 0.40     (directional efficiency)
+      3. Hurst estimate > 0.55               (persistence)
+
+    Falls back gracefully when high/low are missing (uses close only).
+    """
+    import pandas as pd
     mid = df["close"] if "mid" not in df.columns else df["mid"]
-    atr = (df["high"] - df["low"]).rolling(atr_window).mean()
-    directional = (mid - mid.shift(atr_window)).abs()
-    labels = (directional > threshold * atr).astype(int).values
+
+    # ── Signal 1: ADX ──────────────────────────────────────────────────────
+    if "high" in df.columns and "low" in df.columns:
+        adx_val = _adx(df, window=atr_window)
+        vote_adx = (adx_val > 25.0).astype(int)
+    else:
+        # Fallback: use original ATR-directional heuristic
+        atr_fb  = mid.diff().abs().rolling(atr_window).mean()
+        directional = (mid - mid.shift(atr_window)).abs()
+        vote_adx = (directional > threshold * atr_fb).astype(int)
+
+    # ── Signal 2: Fractal Efficiency Ratio ─────────────────────────────────
+    fer      = _fractal_efficiency_ratio(mid, window=atr_window)
+    vote_fer = (fer > 0.40).astype(int)
+
+    # ── Signal 3: Hurst variance ratio ─────────────────────────────────────
+    hurst    = _hurst_variance_ratio(mid, short=5, long=atr_window)
+    vote_hurst = (hurst > 0.55).astype(int)
+
+    # ── Majority vote ───────────────────────────────────────────────────────
+    total_votes = vote_adx.fillna(0) + vote_fer.fillna(0) + vote_hurst.fillna(0)
+    labels = (total_votes >= 2).astype(int).values
     return labels
 
 

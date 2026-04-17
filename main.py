@@ -105,11 +105,36 @@ def cmd_live(args):
     run_live_loop(model, None, tick_stream, account_info, symbol=sym)
 
 
-def cmd_multi_live(args):
-    """Watch MT5 open charts via ATS_Panel registration files and auto-start a
-    signal-server thread per symbol. No --symbol needed — charts self-register."""
-    from mt5_bridge.multi_runner import run_multi_live
+def cmd_run(args):
+    """Multi-symbol runner — auto-detects all open MT5 charts."""
+    from mt5_bridge.runner import run_multi_live
     run_multi_live()
+
+
+def cmd_export(args):
+    """Export trade journal to CSV.
+
+    Example:
+        python main.py export --symbol XAUUSD --out reports/journal.csv
+    """
+    from pathlib import Path
+    from risk.journal import TradeJournal
+
+    sym  = args.symbol.upper()
+    path = Path(f"logs/trade_journal_{sym.lower()}.json")
+
+    if not path.exists():
+        print(f"No journal found at {path}. Start the runner first.")
+        return
+
+    journal = TradeJournal(path=path)
+    out     = Path(args.out)
+    journal.to_csv(out)
+    stats = journal.stats()
+    print(f"Exported {stats['total_trades']} trades to {out}")
+    print(f"  Win rate      : {stats['win_rate']*100:.1f}%")
+    print(f"  Profit factor : {stats['profit_factor']:.2f}")
+    print(f"  Net P&L       : ${stats['total_net_pnl']:+,.2f}")
 
 
 def main():
@@ -163,12 +188,25 @@ def main():
     _add_symbol(p)
     p.set_defaults(func=cmd_live)
 
-    # Multi-live (auto-detect from open MT5 charts via ATS_Panel)
+    # ── Unified runner (recommended) ─────────────────────────────────────────
+
     p = sub.add_parser(
-        "multi-live",
-        help="Auto-detect open MT5 charts and run signal server per symbol",
+        "run",
+        help="[RECOMMENDED] Auto-detect open MT5 charts and start trading",
     )
-    p.set_defaults(func=cmd_multi_live)
+    p.set_defaults(func=cmd_run)
+
+    # Export trade journal to CSV
+    p = sub.add_parser(
+        "export",
+        help="Export trade journal to CSV",
+    )
+    _add_symbol(p)
+    p.add_argument(
+        "--out", default="reports/journal.csv",
+        help="Output CSV path (default: reports/journal.csv)",
+    )
+    p.set_defaults(func=cmd_export)
 
     args = parser.parse_args()
     if args.command is None:

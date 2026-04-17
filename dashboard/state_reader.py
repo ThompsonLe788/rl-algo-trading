@@ -1,8 +1,11 @@
 """Parse live_state.json into typed dataclasses for Streamlit + Telegram."""
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -72,11 +75,21 @@ class LiveState:
 
 
 def read_state(path: Path | None = None) -> LiveState:
-    """Read and parse live_state.json. Returns empty LiveState if file missing."""
+    """Read and parse live_state.json. Returns empty LiveState on any read failure."""
     path = path or LIVE_STATE_PATH
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return LiveState()
+    except json.JSONDecodeError as exc:
+        log.warning("state_reader: JSON decode error in %s: %s", path, exc)
+        return LiveState()
+    except OSError as exc:
+        # Windows file lock or permission error during concurrent write
+        log.warning("state_reader: OS error reading %s: %s", path, exc)
+        return LiveState()
+    except Exception as exc:
+        log.warning("state_reader: unexpected error reading %s: %s", path, exc)
         return LiveState()
 
     symbols: dict[str, SymbolState] = {}

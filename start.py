@@ -1,34 +1,42 @@
 """ATS System Startup Script.
 
-Performs pre-flight checks, trains models if missing,
-then launches signal server + Streamlit dashboard as subprocesses.
+Performs pre-flight checks then launches the multi-symbol runner +
+Streamlit dashboard + optional Telegram bot as subprocesses.
 
 Usage:
-  python start.py                    # XAUUSD, use real MT5 data if available
-  python start.py --symbol EURUSD    # other symbol
-  python start.py --synthetic        # force synthetic data for quick start
-  python start.py --dashboard-only   # only start Streamlit (no signal server)
+  python start.py                  # auto-detect open MT5 charts, start trading
+  python start.py --dashboard-only # dashboard only, no trading
 """
 import argparse
+import os
 import subprocess
 import sys
-import shutil
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from config import MODEL_DIR, DATA_DIR, LOG_DIR, LIVE_STATE_PATH
+# Force UTF-8 stdout so Unicode characters render on Windows CP1252 terminals
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+try:
+    from dotenv import load_dotenv
+    _env = ROOT / ".env"
+    if _env.exists():
+        load_dotenv(_env)
+except ImportError:
+    pass
 
-# ---------------------------------------------------------------------------
-# ANSI colours (works in Windows Terminal)
-# ---------------------------------------------------------------------------
+from config import MODEL_DIR, MT5_FILES_PATH
+
 GREEN  = "\033[92m"
 YELLOW = "\033[93m"
 RED    = "\033[91m"
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
+CYAN   = "\033[96m"
 
 ok   = lambda s: print(f"{GREEN}  [OK]{RESET}  {s}")
 warn = lambda s: print(f"{YELLOW} [WARN]{RESET} {s}")
@@ -61,73 +69,45 @@ def check_mt5() -> bool:
     try:
         import MetaTrader5 as mt5
         if not mt5.initialize():
-            warn(f"MT5 terminal not connected: {mt5.last_error()}")
-            info("Start MetaTrader 5 terminal and try again, or use --synthetic")
+            warn(f"MT5 not connected: {mt5.last_error()}")
+            info("Start MetaTrader 5 and log in, then retry.")
             return False
-        info_mt5 = mt5.terminal_info()
+        term = mt5.terminal_info()
+        acc  = mt5.account_info()
         mt5.shutdown()
-        ok(f"MetaTrader 5 connected ({info_mt5.name})")
+        ok(f"MetaTrader 5 connected ({term.name})")
+        if acc:
+            ok(f"Account #{acc.login}  balance=${acc.balance:,.2f}  equity=${acc.equity:,.2f}")
         return True
     except ImportError:
-        warn("MetaTrader5 package not installed — will use synthetic data")
+        warn("MetaTrader5 package not installed")
         return False
 
 
-def check_or_migrate_model(symbol: str) -> bool:
-    """Return True if usable model found or migrated."""
-    new_path = MODEL_DIR / f"ppo_{symbol.lower()}.zip"
-    if new_path.exists():
-        ok(f"Model found: {new_path.name}")
-        return True
-
-    # Try to migrate old hardcoded names
-    old_candidates = [
-        MODEL_DIR / "ppo_xau.zip",
-        MODEL_DIR / "ppo_xauusd.zip",
-        MODEL_DIR / f"ppo_{symbol[:3].lower()}.zip",
-    ]
-    for old in old_candidates:
-        if old.exists():
-            shutil.copy2(old, new_path)
-            ok(f"Migrated {old.name} → {new_path.name}")
-            return True
-
-    warn(f"No PPO model for {symbol} — will train on synthetic data")
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Model training (synthetic)
-# ---------------------------------------------------------------------------
-
-def train_quick(symbol: str):
-    print(f"\n{BOLD}Training PPO on synthetic data for {symbol}...{RESET}")
-    print("  (50 000 bars, 200 000 timesteps — takes ~2-4 min)")
-    result = subprocess.run(
-        [sys.executable, "main.py", "train-ppo",
-         "--symbol", symbol,
-         "--synthetic",
-         "--bars", "50000",
-         "--timesteps", "200000"],
-        cwd=ROOT,
-    )
-    if result.returncode != 0:
-        fail("Training failed")
-        sys.exit(1)
-    ok(f"PPO model trained for {symbol}")
+def check_open_charts() -> list[str]:
+    try:
+        symbols = []
+        for f in MT5_FILES_PATH.glob("ats_chart_*.txt"):
+            for enc in ("utf-16", "utf-8", "latin-1"):
+                try:
+                    if f.read_text(encoding=enc).strip() == "1":
+                        symbols.append(f.stem.replace("ats_chart_", "").upper())
+                        break
+                except Exception:
+                    pass
+        return symbols
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
 # Launch subprocesses
 # ---------------------------------------------------------------------------
 
-def start_signal_server(symbol: str) -> subprocess.Popen:
-    print(f"\n{BOLD}Starting signal server [{symbol}]...{RESET}")
-    proc = subprocess.Popen(
-        [sys.executable, "main.py", "live", "--symbol", symbol],
-        cwd=ROOT,
-    )
-    ok(f"Signal server PID {proc.pid} — ZMQ PUB on tcp://127.0.0.1:5555")
+def start_runner() -> subprocess.Popen:
+    print(f"\n{BOLD}Starting runner...{RESET}")
+    proc = subprocess.Popen([sys.executable, "main.py", "run"], cwd=ROOT)
+    ok(f"Runner PID {proc.pid} — auto-detects all open MT5 charts")
     return proc
 
 
@@ -143,14 +123,10 @@ def start_dashboard() -> subprocess.Popen:
     return proc
 
 
-def start_telegram_bot() -> subprocess.Popen | None:
-    import os
-    token = os.environ.get("TELEGRAM_TOKEN", "")
-    if not token:
-        warn("TELEGRAM_TOKEN not set — Telegram bot not started")
-        info("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID env vars to enable")
+def start_telegram_bot() -> "subprocess.Popen | None":
+    if not os.environ.get("TELEGRAM_TOKEN"):
+        warn("TELEGRAM_TOKEN not set — Telegram bot disabled")
         return None
-    print(f"\n{BOLD}Starting Telegram bot...{RESET}")
     proc = subprocess.Popen(
         [sys.executable, "dashboard/telegram_bot.py"],
         cwd=ROOT,
@@ -160,21 +136,22 @@ def start_telegram_bot() -> subprocess.Popen | None:
 
 
 # ---------------------------------------------------------------------------
-# Print MT5 EA setup instructions
+# MT5 EA setup instructions
 # ---------------------------------------------------------------------------
 
-def print_mt5_instructions(symbol: str):
+def print_mt5_instructions():
     print(f"""
 {BOLD}MT5 Setup (manual steps){RESET}
-  1. Open {symbol} chart in MetaTrader 5
-  2. Drag {BOLD}XauDayTrader{RESET} EA onto the chart
-     - ZmqAddress: tcp://127.0.0.1:5555
-     - ZmqTopic:   (leave blank — auto-uses {symbol})
+  For EACH symbol you want to trade:
+  1. Open the chart in MetaTrader 5
+  2. Drag {BOLD}XauDayTrader{RESET} EA  ->  MQL5\\Experts\\
+     - ZmqAddress : tcp://127.0.0.1:5555
      - MagicNumber: 20250411
-  3. Drag {BOLD}ATS_Panel{RESET} indicator onto the same chart
-     - Panel will appear top-right showing live state
+  3. Drag {BOLD}ATS_Panel{RESET} indicator  ->  MQL5\\Indicators\\
+     - Panel shows live state top-left
 
-  Signal file fallback: {symbol.lower()}_signal.json in MT5 Common Files
+  The runner auto-detects every open chart. Supported symbols:
+  XAUUSD, EURUSD, GBPUSD, USDJPY, BTCUSD, NAS100, and more.
 """)
 
 
@@ -184,54 +161,59 @@ def print_mt5_instructions(symbol: str):
 
 def main():
     parser = argparse.ArgumentParser(description="ATS System Startup")
-    parser.add_argument("--symbol",         default="XAUUSD")
-    parser.add_argument("--synthetic",      action="store_true",
-                        help="Force synthetic data (skip MT5 live feed)")
-    parser.add_argument("--dashboard-only", action="store_true",
-                        help="Start only Streamlit (no signal server)")
+    parser.add_argument(
+        "--dashboard-only", action="store_true",
+        help="Start Streamlit dashboard only (no trading)",
+    )
     args = parser.parse_args()
 
-    symbol = args.symbol.upper()
+    print(f"\n{BOLD}{CYAN}{'='*55}")
+    print(f"  ATS Multi-Symbol Trading System")
+    print(f"{'='*55}{RESET}\n")
 
-    print(f"\n{BOLD}{'='*50}")
-    print(f"  ATS System Startup — {symbol}")
-    print(f"{'='*50}{RESET}\n")
-
-    # Dependency checks
     if not check_deps():
         sys.exit(1)
 
     mt5_ok = check_mt5()
 
-    # Model check / train
     if not args.dashboard_only:
-        model_ok = check_or_migrate_model(symbol)
-        if not model_ok:
-            train_quick(symbol)
+        open_charts = check_open_charts()
+        if open_charts:
+            ok(f"Open charts detected: {', '.join(open_charts)}")
+            for sym in open_charts:
+                path = MODEL_DIR / f"ppo_{sym.lower()}.zip"
+                if path.exists():
+                    ok(f"  Model: {path.name}")
+                else:
+                    warn(f"  No model for {sym} — will auto-train on first run (~3 min)")
+        else:
+            warn("No open MT5 charts detected yet")
+            info("Open a chart and attach ATS_Panel — it will auto-register")
+
+    if not mt5_ok and not args.dashboard_only:
+        warn("MT5 not connected — runner will retry every 5s until connected")
 
     print()
-
     procs = []
 
     if not args.dashboard_only:
-        if not mt5_ok and not args.synthetic:
-            warn("MT5 not connected — signal server may fail to get live ticks")
-            info("Continuing anyway (file-based fallback will be used)...")
-        procs.append(start_signal_server(symbol))
+        procs.append(start_runner())
 
     procs.append(start_dashboard())
+
     tg = start_telegram_bot()
     if tg:
         procs.append(tg)
 
-    print_mt5_instructions(symbol)
+    print_mt5_instructions()
 
-    print(f"\n{BOLD}{GREEN}System running.{RESET} Press Ctrl+C to stop all processes.\n")
+    print(f"\n{BOLD}{GREEN}System running.{RESET}")
+    print(f"  Dashboard : http://localhost:8501")
+    print(f"  Status    : python main.py status")
+    print(f"  Ctrl+C    : stop all\n")
 
     try:
-        # Wait — if any child dies unexpectedly, report it
         while True:
-            import time
             time.sleep(3)
             for p in procs:
                 if p.poll() is not None:

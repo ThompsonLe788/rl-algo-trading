@@ -1,17 +1,17 @@
-"""Enhanced Fractional Kelly position sizing.
+"""Enhanced Fractional Kelly position sizing — symbol-agnostic.
 
 f* = (1/fraction_denom) * (p*b - q) / b
 
 Features:
+- Per-symbol leverage and contract size from SYMBOL_CONFIGS
 - Rolling 200-trade Bayesian win rate (Beta(α,β) posterior)
 - Hard cap at 2% risk per trade
-- Leverage-aware for 1:2000 XAUUSD
 - Drawdown-scaled: cuts size linearly as DD grows
 - Regime-aware: halves size in uncertain/range regimes
 - Edge-decay detection: zeros out if recent edge is negative
 - Streak dampener: reduces size on losing streaks
 - Margin-aware: respects broker margin requirements
-- JSON persistence for restart recovery
+- Per-symbol JSON persistence for restart recovery
 """
 import json
 import logging
@@ -27,7 +27,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     KELLY_FRACTION, MAX_RISK_PER_TRADE, LEVERAGE, ROLLING_WINDOW,
-    LOG_DIR, MAX_DRAWDOWN_PCT,
+    LOG_DIR, MAX_DRAWDOWN_PCT, get_symbol_config,
 )
 
 logger = logging.getLogger("kelly")
@@ -68,29 +68,41 @@ class KellyPositionSizer:
     STREAK_DECAY = 0.25
     MAX_STREAK_PENALTY = 0.75  # never cut more than 75%
 
-    # -- Margin: typical XAUUSD margin % for 1:2000
-    MARGIN_PCT = 1.0 / 2000  # 0.05%
+    # -- Volatility regime: number of recent bars tracked for rvol z-score
+    VOL_HISTORY_LEN = 500   # ~8 hours of M1 data
 
     def __init__(
         self,
+        symbol: str = "XAUUSD",
         fraction: float = KELLY_FRACTION,
         max_risk: float = MAX_RISK_PER_TRADE,
-        leverage: int = LEVERAGE,
+        leverage: int | None = None,
         rolling_window: int = ROLLING_WINDOW,
         persist_path: Path | None = None,
     ):
+        self.symbol   = symbol.upper()
         self.fraction = fraction
         self.max_risk = max_risk
-        self.leverage = leverage
         self.rolling_window = rolling_window
         self.trade_history: deque[TradeRecord] = deque(maxlen=rolling_window)
-        self.persist_path = persist_path or (LOG_DIR / "kelly_state.json")
+
+        # Per-symbol leverage and margin from SYMBOL_CONFIGS
+        sym_cfg       = get_symbol_config(self.symbol)
+        self.leverage = leverage if leverage is not None else sym_cfg["leverage"]
+        self.MARGIN_PCT = 1.0 / self.leverage   # standard broker margin formula
+
+        self.persist_path = persist_path or (
+            LOG_DIR / f"kelly_state_{self.symbol.lower()}.json"
+        )
 
         # Drawdown tracking (fed externally)
         self._current_dd_pct: float = 0.0
 
         # Active regime (fed externally)
         self._regime: int = -1  # 0=range, 1=trend
+
+        # Volatility regime: rolling realized-vol history for z-score (⑩)
+        self._rvol_history: deque[float] = deque(maxlen=self.VOL_HISTORY_LEN)
 
         self._try_load()
 
@@ -120,6 +132,11 @@ class KellyPositionSizer:
     def set_regime(self, regime: int):
         self._regime = regime
 
+    def update_rvol(self, rvol: float):
+        """Feed current realized volatility for macro vol-regime tracking. (⑩)"""
+        if rvol > 0:
+            self._rvol_history.append(rvol)
+
     # ------------------------------------------------------------------
     # Record trades
     # ------------------------------------------------------------------
@@ -130,19 +147,24 @@ class KellyPositionSizer:
     # ------------------------------------------------------------------
     # Rolling Bayesian win rate  Beta(α + wins, β + losses)
     # ------------------------------------------------------------------
+    # Minimum PnL magnitude to count as a win or loss (1 pip = $0.01 equivalent).
+    # Trades with |pnl| < this threshold are treated as scratch/neutral and excluded
+    # from the Bayesian win-rate to avoid inflating the loss count with break-evens.
+    PNL_SCRATCH_THRESHOLD = 0.01
+
     @property
     def win_rate(self) -> float:
-        wins = sum(1 for t in self.trade_history if t.pnl > 0)
-        losses = sum(1 for t in self.trade_history if t.pnl <= 0)
+        wins   = sum(1 for t in self.trade_history if t.pnl >  self.PNL_SCRATCH_THRESHOLD)
+        losses = sum(1 for t in self.trade_history if t.pnl < -self.PNL_SCRATCH_THRESHOLD)
         alpha = self.PRIOR_ALPHA + wins
-        beta = self.PRIOR_BETA + losses
+        beta  = self.PRIOR_BETA  + losses
         return alpha / (alpha + beta)
 
     @property
     def win_rate_ci_lower(self) -> float:
         """5th percentile of Beta posterior — conservative bound."""
-        wins = sum(1 for t in self.trade_history if t.pnl > 0)
-        losses = sum(1 for t in self.trade_history if t.pnl <= 0)
+        wins   = sum(1 for t in self.trade_history if t.pnl >  self.PNL_SCRATCH_THRESHOLD)
+        losses = sum(1 for t in self.trade_history if t.pnl < -self.PNL_SCRATCH_THRESHOLD)
         from scipy.stats import beta as beta_dist
         a = self.PRIOR_ALPHA + wins
         b = self.PRIOR_BETA + losses
@@ -150,12 +172,12 @@ class KellyPositionSizer:
 
     @property
     def avg_win(self) -> float:
-        wins = [t.pnl for t in self.trade_history if t.pnl > 0]
+        wins = [t.pnl for t in self.trade_history if t.pnl > self.PNL_SCRATCH_THRESHOLD]
         return float(np.mean(wins)) if wins else 1.0
 
     @property
     def avg_loss(self) -> float:
-        losses = [abs(t.pnl) for t in self.trade_history if t.pnl < 0]
+        losses = [abs(t.pnl) for t in self.trade_history if t.pnl < -self.PNL_SCRATCH_THRESHOLD]
         return float(np.mean(losses)) if losses else 1.0
 
     @property
@@ -179,7 +201,7 @@ class KellyPositionSizer:
     def consecutive_losses(self) -> int:
         streak = 0
         for t in reversed(self.trade_history):
-            if t.pnl <= 0:
+            if t.pnl < -self.PNL_SCRATCH_THRESHOLD:
                 streak += 1
             else:
                 break
@@ -193,10 +215,11 @@ class KellyPositionSizer:
         if len(self.trade_history) < self.EDGE_DECAY_WINDOW:
             return True
         recent = list(self.trade_history)[-self.EDGE_DECAY_WINDOW:]
-        wins = sum(1 for t in recent if t.pnl > 0)
+        wins = sum(1 for t in recent if t.pnl > self.PNL_SCRATCH_THRESHOLD)
         p = wins / len(recent)
-        avg_w = np.mean([t.pnl for t in recent if t.pnl > 0]) if wins else 0
-        avg_l = np.mean([abs(t.pnl) for t in recent if t.pnl < 0]) if (len(recent) - wins) else 0
+        avg_w = np.mean([t.pnl for t in recent if t.pnl > self.PNL_SCRATCH_THRESHOLD]) if wins else 0
+        losses_r = [abs(t.pnl) for t in recent if t.pnl < -self.PNL_SCRATCH_THRESHOLD]
+        avg_l = np.mean(losses_r) if losses_r else 0
         edge = p * avg_w - (1 - p) * avg_l
         return edge > 0
 
@@ -216,12 +239,14 @@ class KellyPositionSizer:
         return max(f, 0.0)
 
     def _drawdown_scalar(self) -> float:
-        """Linear taper: 1.0 at dd<=start, 0.0 at dd>=end."""
+        """Linear taper: 1.0 at dd<=start, 0.0 at dd>=end.
+        Clamped to [0, 1] so extreme DD beyond taper_end never goes negative."""
         if self._current_dd_pct <= self.DD_TAPER_START:
             return 1.0
         if self._current_dd_pct >= self.DD_TAPER_END:
             return 0.0
-        return 1.0 - (self._current_dd_pct - self.DD_TAPER_START) / (self.DD_TAPER_END - self.DD_TAPER_START)
+        raw = 1.0 - (self._current_dd_pct - self.DD_TAPER_START) / (self.DD_TAPER_END - self.DD_TAPER_START)
+        return max(0.0, min(1.0, raw))
 
     def _regime_scalar(self) -> float:
         """Halve size in range regime (0), full in trend (1), 75% if unknown."""
@@ -238,6 +263,28 @@ class KellyPositionSizer:
             return 1.0
         penalty = min(losses * self.STREAK_DECAY, self.MAX_STREAK_PENALTY)
         return 1.0 - penalty
+
+    def _vol_regime_scalar(self) -> float:
+        """Scale down sizing when realized volatility is elevated. (⑩)
+
+        Compares current rvol (last reading) against the rolling mean/std
+        of the past VOL_HISTORY_LEN bars:
+          rvol z-score > 2σ  → 0.50× (half size — macro vol spike)
+          rvol z-score > 1σ  → 0.75× (cautious — elevated vol)
+          otherwise          → 1.00×
+        """
+        if len(self._rvol_history) < 30:
+            return 1.0
+        hist = list(self._rvol_history)
+        current = hist[-1]
+        mean_v = float(np.mean(hist))
+        std_v  = float(np.std(hist)) + 1e-9
+        z = (current - mean_v) / std_v
+        if z > 2.0:
+            return 0.50
+        if z > 1.0:
+            return 0.75
+        return 1.0
 
     def optimal_fraction(self, p: float | None = None, b: float | None = None) -> float:
         """Enhanced fractional Kelly with all guards applied.
@@ -262,8 +309,14 @@ class KellyPositionSizer:
             logger.warning("Edge decay detected — sizing zeroed")
             return 0.0
 
-        # Multiplicative scalars
-        f = base * self._drawdown_scalar() * self._regime_scalar() * self._streak_scalar()
+        # Multiplicative scalars (⑩ vol_regime_scalar added)
+        f = (
+            base
+            * self._drawdown_scalar()
+            * self._regime_scalar()
+            * self._streak_scalar()
+            * self._vol_regime_scalar()
+        )
 
         return min(max(f, 0.0), self.max_risk)
 
@@ -275,7 +328,7 @@ class KellyPositionSizer:
         account_equity: float,
         entry_price: float,
         sl_distance: float,
-        contract_size: float = 100.0,  # 1 lot = 100 oz XAUUSD
+        contract_size: float | None = None,   # defaults to per-symbol config
         p: float | None = None,
         b: float | None = None,
     ) -> float:
@@ -283,13 +336,17 @@ class KellyPositionSizer:
 
         lot = (equity * f*) / (sl_distance * contract_size)
         Capped by leverage and free-margin constraints.
+        contract_size defaults to SYMBOL_CONFIGS[symbol]["contract_size"].
         """
+        if contract_size is None:
+            contract_size = get_symbol_config(self.symbol)["contract_size"]
         f = self.optimal_fraction(p, b)
         if f <= 0:
             return 0.0
 
         risk_amount = account_equity * f
         if sl_distance <= 0:
+            logger.warning("[%s] sl_distance <= 0 (got %.6f) — lot=0. ATR missing?", self.symbol, sl_distance)
             return 0.0
 
         lot = risk_amount / (sl_distance * contract_size)
@@ -305,8 +362,13 @@ class KellyPositionSizer:
             max_lot_margin = (account_equity * 0.9) / margin_per_lot  # keep 10% buffer
             lot = min(lot, max_lot_margin)
 
-        # Floor + round to 0.01
-        lot = max(round(lot, 2), 0.01)
+        # Symbol max_lot hard cap (from SYMBOL_CONFIGS)
+        max_lot_sym = get_symbol_config(self.symbol).get("max_lot", float("inf"))
+        lot = min(lot, max_lot_sym)
+
+        # Floor + round to per-symbol lot step (configurable via lot_precision).
+        lp = get_symbol_config(self.symbol).get("lot_precision", 2)
+        lot = max(round(lot, lp), 10 ** (-lp))
         return lot
 
     # ------------------------------------------------------------------
@@ -326,6 +388,7 @@ class KellyPositionSizer:
             "regime_scalar": round(self._regime_scalar(), 4),
             "consecutive_losses": self.consecutive_losses,
             "streak_scalar": round(self._streak_scalar(), 4),
+            "vol_regime_scalar": round(self._vol_regime_scalar(), 4),
             "edge_alive": self.recent_edge_alive,
         }
 
@@ -339,6 +402,7 @@ def vwap_slice_orders(
     atr: float,
     num_slices: int = 5,
     atr_spread: float = 0.3,
+    min_lot: float = 0.01,
 ) -> list[dict]:
     """Split large orders into child limit orders around VWAP ± spread*ATR.
 
@@ -358,8 +422,8 @@ def vwap_slice_orders(
     if total_lot <= 0:
         return []
     child_lot = round(total_lot / num_slices, 2)
-    if child_lot < 0.01:
-        child_lot = 0.01
+    if child_lot < min_lot:
+        child_lot = min_lot
 
     offsets = np.linspace(-atr_spread * atr, atr_spread * atr, num_slices)
     orders = []
@@ -368,7 +432,7 @@ def vwap_slice_orders(
         lot = child_lot if i < num_slices - 1 else round(remaining, 2)
         orders.append({
             "price": round(base_price + offset, 2),
-            "lot": max(lot, 0.01),
+            "lot": max(lot, min_lot),
             "delay_seconds": i * 30,
         })
         remaining -= child_lot
@@ -386,6 +450,7 @@ def twap_slice_orders(
     num_slices: int = 5,
     side: int = 1,
     tick_size: float = 0.01,
+    min_lot: float = 0.01,
 ) -> list[dict]:
     """Split a large order into equal child limit orders spaced evenly over time.
 
@@ -421,8 +486,8 @@ def twap_slice_orders(
 
     # Equal-size children; last slice absorbs rounding remainder
     child_lot = round(total_lot / num_slices, 2)
-    if child_lot < 0.01:
-        child_lot = 0.01
+    if child_lot < min_lot:
+        child_lot = min_lot
 
     # Passive limit price: 1 tick inside spread
     limit_price = round(base_price - side * tick_size, 2)
@@ -433,7 +498,7 @@ def twap_slice_orders(
     orders = []
     remaining = total_lot
     for i in range(num_slices):
-        lot = child_lot if i < num_slices - 1 else max(round(remaining, 2), 0.01)
+        lot = child_lot if i < num_slices - 1 else max(round(remaining, 2), min_lot)
         orders.append({
             "price": limit_price,
             "lot": lot,

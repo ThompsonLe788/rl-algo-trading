@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from ai_models.rl_agent import train_ppo, XauIntradayEnv
+from ai_models.rl_agent import train_ppo, XauIntradayEnv, calc_execution_price
 from backtest.tca import run_tca, TCAReport
 from stable_baselines3 import PPO
 
@@ -88,17 +88,15 @@ def evaluate_agent(model: PPO, test_df: pd.DataFrame) -> FoldMetrics:
 
         # Detect trade opening/closing for fill records
         if action in (1, 2) and prev_position == 0 and cur_position != 0:
-            # Limit order fill: simulate queue slippage (0-0.3 bps random)
-            spread_bps = 0.8
-            slip_bps = np.random.uniform(0, 0.3)
             side = 1 if action == 1 else -1
-            fill_price = arrival + side * (spread_bps + slip_bps) * 1e-4 * arrival
+            # Realistic fill price via square-root impact model (⑫)
+            fill_price = calc_execution_price(arrival, side, lot=0.01)
             fills.append({
                 "fill_price": fill_price,
                 "arrival_price": arrival,
                 "decision_price": arrival,
                 "side": side,
-                "lot": 0.01,       # normalized lot; weight by actual lot in live
+                "lot": 0.01,
                 "bar_index": bar_idx,
             })
             trades += 1

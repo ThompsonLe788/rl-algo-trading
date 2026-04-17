@@ -11,7 +11,7 @@ A production-grade automated trading system (ATS) for **XAU/USD (Gold)** using R
 
 ## Overview
 
-The system trains a **PPO/SAC reinforcement learning agent** on M1 bar data, then executes intraday trades in real-time using tick data. It supports multiple symbols simultaneously with automatic worker management.
+The system trains a **PPO reinforcement learning agent** on M1 bar data, then executes intraday trades in real-time using tick data. It supports multiple symbols simultaneously with automatic worker management and self-retraining.
 
 ```
 MT5 Terminal (tick data)
@@ -26,8 +26,9 @@ PPO Agent → Decision: Long / Short / Hold / Close
 Risk Manager: Fractional Kelly (1/10), Kill Switch (15% MDD), ATR trailing stop
     │
     ▼
-ZeroMQ PUB → MT5 EA → OrderSend()
+ZeroMQ PUB → XauDayTrader EA → OrderSend()
     │
+    ├── ATS_Panel Indicator (top-left panel: 7 sections, live state)
     ├── Streamlit Dashboard (localhost:8501)
     └── Telegram Bot (real-time alerts)
 ```
@@ -43,7 +44,9 @@ ZeroMQ PUB → MT5 EA → OrderSend()
 | **Models** | PPO (default), SAC (sample-efficient), T-KAN (regime classifier) |
 | **Position sizing** | Fractional Kelly Criterion (1/10 Kelly) |
 | **Risk controls** | Kill switch (MDD 15%), EOD close (22h GMT), ATR trailing stop |
-| **Multi-symbol** | XAUUSD, EURUSD, BTCUSD, any MT5 symbol — via auto-detection |
+| **Multi-symbol** | XAUUSD, EURUSD, GBPUSD, USDJPY, BTCUSD, NAS100 — auto-detection |
+| **Auto-retrain** | Weekly (Monday) + drift detection (win_rate < 43%), live model hot-swap |
+| **MT5 Panel** | Top-left indicator: 7 sections — MARKET, POSITION, SIGNALS, RISK, AI MODEL, SYSTEM |
 | **Latency** | ZMQ PUB/SUB < 1ms signal delivery |
 | **Walk-forward** | Rolling backtest with TCA (slippage, market impact) |
 
@@ -54,35 +57,39 @@ ZeroMQ PUB → MT5 EA → OrderSend()
 ```
 d:/xau_ats/
 ├── ai_models/
-│   ├── features.py         ← 24 features: OU z-score, ATR, VWAP, LOB, momentum
-│   ├── rl_agent.py         ← PPO/SAC train & inference (stable-baselines3)
-│   ├── regime_tkan.py      ← T-KAN regime classifier (RANGE/TREND)
-│   ├── trading_env.py      ← Gym environment with Sharpe-adjusted reward
-│   └── checkpoints/        ← Trained model weights (not tracked in git)
+│   ├── features.py          ← 24 features: OU z-score, ATR, VWAP, LOB, momentum
+│   ├── rl_agent.py          ← PPO/SAC train & inference (stable-baselines3)
+│   ├── regime_tkan.py       ← T-KAN regime classifier (RANGE/TREND)
+│   ├── trading_env.py       ← Gym environment with Sharpe-adjusted reward
+│   └── checkpoints/         ← Trained model weights (ppo_SYMBOL.zip)
 ├── backtest/
-│   ├── walkforward.py      ← Walk-forward engine with TimeSeriesSplit
-│   └── tca.py              ← Transaction cost analysis
+│   ├── walkforward.py       ← Walk-forward engine with TimeSeriesSplit
+│   └── tca.py               ← Transaction cost analysis
 ├── dashboard/
-│   ├── app.py              ← Streamlit dashboard
-│   ├── state_reader.py     ← live_state.json parser
-│   └── telegram_bot.py     ← Telegram alerts (kill switch, drawdown, trades)
+│   ├── app.py               ← Streamlit dashboard (localhost:8501)
+│   ├── state_reader.py      ← live_state.json parser
+│   └── telegram_bot.py      ← Telegram alerts
 ├── data/
-│   └── pipeline.py         ← MT5 fetch, Parquet cache, LiveTickStream, synthetic GBM+OU
+│   └── pipeline.py          ← MT5 fetch, Parquet cache, LiveTickStream, synthetic GBM+OU
 ├── docs/
-│   ├── technical_guide.md  ← Full technical documentation (Vietnamese)
-│   ├── user_guide.md       ← Installation & operation guide (Vietnamese)
-│   └── service_handbook.md ← Daily ops & incident response (Vietnamese)
+│   ├── user_guide.md        ← Installation & operation guide (Vietnamese)
+│   ├── service_handbook.md  ← Daily ops & incident response (Vietnamese)
+│   └── technical_guide.md   ← Full technical documentation (Vietnamese)
 ├── mt5_bridge/
-│   ├── ATS_Panel.mq5       ← MT5 Expert Advisor (order execution)
-│   ├── ATS_StrategyView.mq5← MT5 Indicator (strategy visualization)
-│   ├── multi_runner.py     ← Multi-symbol orchestrator with shared ZMQ socket
-│   └── signal_server.py    ← ZMQ PUB server + LiveStateWriter
+│   ├── ATS_Panel.mq5        ← MT5 Indicator (top-left panel, 7 sections)
+│   ├── XauDayTrader.mq5     ← MT5 Expert Advisor (ZMQ → OrderSend)
+│   ├── ATS_StrategyView.mq5 ← MT5 Indicator (chart overlays: VWAP, signals)
+│   ├── multi_runner.py      ← Multi-symbol orchestrator, shared ZMQ socket
+│   ├── signal_server.py     ← ZMQ PUB server + LiveStateWriter singleton
+│   └── auto_retrainer.py    ← AutoRetrainer: weekly + drift-triggered hot-swap
 ├── risk/
-│   ├── kelly.py            ← Fractional Kelly with Bayesian win rate, VWAP slicer
-│   └── kill_switch.py      ← MDD/daily loss/EOD liquidation
-├── config.py               ← All parameters (risk, timing, ZMQ, training)
-├── main.py                 ← CLI entry point
-└── tests/test_ats.py       ← 38 test cases
+│   ├── kelly.py             ← Fractional Kelly with Bayesian win rate, VWAP slicer
+│   ├── kill_switch.py       ← MDD/daily loss/EOD liquidation
+│   └── news_filter.py       ← High-impact news blackout window
+├── config.py                ← All parameters (risk, timing, ZMQ, training, symbols)
+├── main.py                  ← CLI entry point
+├── start.py                 ← Startup script (pre-flight checks + launch)
+└── tests/test_ats.py        ← 38 test cases
 ```
 
 ---
@@ -104,7 +111,7 @@ pip install -r requirements.txt
 
 # 2. Copy environment template
 copy .env.example .env
-# Edit .env with your Telegram bot token (optional)
+# Edit .env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (optional)
 
 # 3. Start MetaTrader 5 and log in
 
@@ -115,8 +122,53 @@ python main.py multi-live
 streamlit run dashboard/app.py
 # → Open http://localhost:8501
 
-# 6. In MT5: drag ATS_Panel.mq5 onto a XAUUSD M1 chart
+# 6. In MT5 for each symbol chart:
+#    a. Drag XauDayTrader EA   → MQL5\Experts\    (executes orders via ZMQ)
+#    b. Drag ATS_Panel         → MQL5\Indicators\ (top-left live panel)
 #    → System auto-detects, trains model (~3-5 min first time), goes live
+```
+
+---
+
+## MT5 File Roles
+
+| File | Type | Destination | Role |
+|---|---|---|---|
+| `ATS_Panel.mq5` | **Indicator** | `MQL5\Indicators\` | Live state panel + symbol detection |
+| `XauDayTrader.mq5` | **Expert Advisor** | `MQL5\Experts\` | Receives ZMQ signals, places orders |
+| `ATS_StrategyView.mq5` | Indicator | `MQL5\Indicators\` | Chart overlays (VWAP, signal arrows) |
+
+---
+
+## ATS_Panel — Live State Display
+
+The panel appears **top-left** on any chart with `ATS_Panel` attached. It reads `ats_live_state.json` (Python → MT5 Common Files) and updates every heartbeat (~10s).
+
+```
+┌─────────────────────────────────┐
+│ ATS PANEL — XAUUSD              │
+├─── MARKET ──────────────────────┤
+│  Chart TF: M1  │ ATS TF: M1(RL) │
+│  Session: London│ Spread: 0.8bp  │
+├─── POSITION ────────────────────┤
+│  LONG          │ RANGE           │
+│  Entry: 3200.50  Unrealized: +12 │
+│  SymDD: 0.5%   │ AcctDD: 0.5%   │
+├─── SIGNALS (last 5) ────────────┤
+│  Dir│Price  │Win%│R/R│Lot│Time  │
+│  BUY│3200.50│57% │1.8│0.1│08:32 │
+├─── RISK ────────────────────────┤
+│  Kelly f: 1.67%                  │
+│  Equity: 10,120 │Balance: 10,000 │
+├─── AI MODEL ────────────────────┤
+│  ppo_xauusd [2026-04-15 23:32]  │
+│  Status: Running                 │
+│  WinRate: 55.0% │ Sharpe: 1.23  │
+│  Trades: 34                      │
+├─── SYSTEM ──────────────────────┤
+│  Kill: ---   HB: 3s ago          │
+│  Updated: 10:38:02               │
+└─────────────────────────────────┘
 ```
 
 ---
@@ -126,15 +178,21 @@ streamlit run dashboard/app.py
 All parameters are centralized in `config.py`:
 
 ```python
-MAX_DRAWDOWN_PCT    = 15.0   # Kill switch threshold
-MAX_RISK_PER_TRADE  = 0.02   # Max 2% equity per trade
-KELLY_FRACTION      = 0.1    # 1/10 Kelly (conservative)
-EOD_HOUR_GMT        = 22     # Close all positions at 22:00 GMT
-AUTO_TRAIN_BARS     = 50_000 # M1 bars for training
-AUTO_TRAIN_TIMESTEPS = 200_000  # PPO training steps
-```
+# Risk
+MAX_DRAWDOWN_PCT    = 15.0    # Kill switch threshold
+MAX_RISK_PER_TRADE  = 0.02    # Max 2% equity per trade
+KELLY_FRACTION      = 0.1     # 1/10 Kelly (conservative)
+EOD_HOUR_GMT        = 22      # Close all positions at 22:00 GMT
 
-Sensitive credentials (Telegram token) go in `.env` — never in `config.py`.
+# Auto-Retrain
+DRIFT_WIN_RATE_THRESHOLD = 0.43   # Retrain when win rate < 43%
+RETRAIN_WEEKLY_DAY       = 0      # Monday (ISO weekday)
+RETRAIN_MODEL_ACCEPT_RATIO = 0.90 # Accept new model if Sharpe >= 90% of current
+RETRAIN_BARS             = 50_000 # M1 bars for retrain
+RETRAIN_TIMESTEPS        = 300_000
+
+# Per-symbol configs in SYMBOL_CONFIGS dict (spread, leverage, lot limits, digits)
+```
 
 ---
 
@@ -166,6 +224,13 @@ Input (50 bars × 6 features) → ChebyshevBasis(order=4) → GRU → Softmax
 - Trailing stop: `trail = entry ± 1.5 × ATR`, updates each tick
 - Kill switch: triggers at 15% drawdown, 5% daily loss, or 22:00 GMT
 
+### 5. Auto-Retraining
+- **Weekly**: every Monday, once per ISO week
+- **Drift**: when rolling win-rate < 43% (min 30 trades, 24h cooldown)
+- **Evaluation**: 3 time-window walk-forward × 2 seeds → mean Sharpe gate
+- **Hot-swap**: new model replaces live model without trading interruption
+- **Rollback**: old model auto-archived as `ppo_SYMBOL_backup_YYYYMMDD_HHMM.zip`
+
 ---
 
 ## Backtest
@@ -195,9 +260,9 @@ Full documentation in Vietnamese in `docs/`:
 
 | Document | Description |
 |---|---|
-| [`technical_guide.md`](docs/technical_guide.md) | Algorithms, model selection, pros/cons, what's missing for professional quant |
-| [`user_guide.md`](docs/user_guide.md) | Installation, configuration, operation, FAQ |
+| [`user_guide.md`](docs/user_guide.md) | Installation, configuration, daily operation, FAQ |
 | [`service_handbook.md`](docs/service_handbook.md) | Daily SOP, incident response, maintenance, retrain schedule |
+| [`technical_guide.md`](docs/technical_guide.md) | Algorithms, model selection, pros/cons |
 
 ---
 

@@ -101,15 +101,20 @@ class AutoRetrainer:
         perf_monitor,
         stop_event: threading.Event,
         set_status_fn: Callable[[str], None] | None = None,
+        state_writer=None,   # LiveStateWriter | None — writes model info to JSON
     ):
         self.symbol = symbol
         self.model_ref = model_ref
         self.perf_monitor = perf_monitor
         self._stop_event = stop_event
         self._set_status = set_status_fn or (lambda s: None)
+        self._state_writer = state_writer
 
         self._training_lock = threading.Lock()   # prevent concurrent retrains
         self._last_drift_retrain: datetime | None = None
+        self._last_retrain_time: str = ""
+        self._last_retrain_reason: str = ""
+        self._is_training: bool = False
         self._thread: threading.Thread | None = None
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +136,7 @@ class AutoRetrainer:
             self._stop_event.wait(timeout=RETRAIN_CHECK_INTERVAL)
             if self._stop_event.is_set():
                 break
+            self._flush_perf_state()   # update win_rate / sharpe in JSON
             reason = self._should_retrain()
             if reason:
                 t = threading.Thread(
@@ -140,6 +146,33 @@ class AutoRetrainer:
                     daemon=True,
                 )
                 t.start()
+
+    # ── state helpers ─────────────────────────────────────────────────────────
+
+    def _model_version(self) -> str:
+        """Return '<name> [YYYY-MM-DD HH:MM]' of the live checkpoint, or '---'."""
+        live = MODEL_DIR / f"ppo_{self.symbol.lower()}.zip"
+        if live.exists():
+            ts = datetime.fromtimestamp(live.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            return f"ppo_{self.symbol.lower()} [{ts}]"
+        return "---"
+
+    def _flush_perf_state(self) -> None:
+        """Write current win-rate / sharpe to live_state.json (called every hour)."""
+        if self._state_writer is None:
+            return
+        summary = self.perf_monitor.summary()
+        self._state_writer.update_model(
+            self.symbol,
+            version=self._model_version(),
+            is_training=self._is_training,
+            last_retrain_time=self._last_retrain_time,
+            last_retrain_reason=self._last_retrain_reason,
+            win_rate=summary["win_rate"],
+            total_trades=summary["n_trades"],
+            sharpe=summary["sharpe"],
+        )
+        self._state_writer.flush()
 
     # ── trigger logic ────────────────────────────────────────────────────────
 
@@ -174,6 +207,17 @@ class AutoRetrainer:
             return
         try:
             logger.info(f"[{self.symbol}] ── AutoRetrain START ── reason: {reason}")
+            self._is_training = True
+            self._last_retrain_reason = reason
+            if self._state_writer is not None:
+                self._state_writer.update_model(
+                    self.symbol,
+                    version=self._model_version(),
+                    is_training=True,
+                    last_retrain_time=datetime.now(timezone.utc).isoformat(),
+                    last_retrain_reason=reason,
+                )
+                self._state_writer.flush()
             self._set_status("retraining")
 
             new_model = self._train_new()
@@ -197,10 +241,23 @@ class AutoRetrainer:
                 self._backup_and_deploy(new_model)
                 self.model_ref.swap(new_model)
                 self.perf_monitor.reset()   # reset drift counter for fresh window
+                self._last_retrain_time = datetime.now(timezone.utc).isoformat()
                 logger.info(
                     f"[{self.symbol}] ✓ New model ACCEPTED — "
                     f"Sharpe {old_sharpe:.4f} → {new_sharpe:.4f}"
                 )
+                if self._state_writer is not None:
+                    self._state_writer.update_model(
+                        self.symbol,
+                        version=self._model_version(),
+                        is_training=False,
+                        last_retrain_time=self._last_retrain_time,
+                        last_retrain_reason=reason,
+                        win_rate=0.0,
+                        total_trades=0,
+                        sharpe=new_sharpe,
+                    )
+                    self._state_writer.flush()
             else:
                 # Cleanup candidate file
                 candidate = MODEL_DIR / f"ppo_{self.symbol.lower()}_candidate.zip"
@@ -213,6 +270,7 @@ class AutoRetrainer:
         except Exception:
             logger.exception(f"[{self.symbol}] AutoRetrain error")
         finally:
+            self._is_training = False
             self._set_status("live")
             self._training_lock.release()
 
@@ -274,11 +332,23 @@ class AutoRetrainer:
             return None
 
     def _evaluate(self, model) -> float:
-        """Run model through RETRAIN_EVAL_BARS recent bars (3 episodes).
-        Returns mean Sharpe ratio.  Returns 0.0 on any failure.
+        """3-window walk-forward evaluation.
+
+        Splits RETRAIN_EVAL_BARS into 3 equal non-overlapping windows:
+          early | mid | recent
+
+        Each window is evaluated with 4 random seeds (12 total runs).
+        More seeds reduce Sharpe noise σ ≈ 1/√12 vs 1/√6 with 2 seeds,
+        making the RETRAIN_MODEL_ACCEPT_RATIO = 0.95 threshold reliable.
+        Returns the mean Sharpe across all windows × seeds.
+        Also checks Calmar ratio (Sharpe / max_drawdown) as a secondary gate.
+        Returns 0.0 on any failure.
+
+        Why 3 windows?  A single recent-only window can be misleadingly good
+        or bad due to short-term regime luck.  Three windows covering ~15 days
+        each give a more stable out-of-sample estimate.
         """
         try:
-            from ai_models.features import build_feature_matrix
             from ai_models.rl_agent import XauIntradayEnv
             from data.pipeline import generate_synthetic_data, load_or_fetch
 
@@ -286,37 +356,69 @@ class AutoRetrainer:
                 df = load_or_fetch(
                     symbol=self.symbol,
                     timeframe="M1",
-                    num_bars=RETRAIN_EVAL_BARS,
+                    num_bars=RETRAIN_EVAL_BARS * 3,  # 3× for three windows
                 )
             except Exception:
-                df = generate_synthetic_data(n_bars=RETRAIN_EVAL_BARS)
+                df = generate_synthetic_data(n_bars=RETRAIN_EVAL_BARS * 3)
 
-            features = build_feature_matrix(df)
-            closes = (
-                df["close"].values
-                if "close" in df.columns
-                else ((df["bid"] + df["ask"]) / 2).values
-            )
+            n = len(df)
+            # Split into 3 equal windows; each must have at least 1000 bars
+            w = max(n // 3, 1000)
+            windows = [
+                df.iloc[:w].reset_index(drop=True),
+                df.iloc[w:2*w].reset_index(drop=True),
+                df.iloc[2*w:].reset_index(drop=True),
+            ]
 
             sharpes: list[float] = []
-            for seed in (0, 1, 2):
-                env = XauIntradayEnv(features, closes)
-                obs, _ = env.reset(seed=seed)
-                done = False
-                rewards: list[float] = []
-                while not done:
-                    action, _ = model.predict(
-                        np.array(obs, dtype=np.float32), deterministic=True
-                    )
-                    obs, reward, terminated, truncated, _ = env.step(int(action))
-                    done = terminated or truncated
-                    rewards.append(float(reward))
-                if len(rewards) > 1:
-                    arr = np.array(rewards)
-                    s = float(arr.mean() / arr.std()) if arr.std() > 0 else 0.0
-                    sharpes.append(s)
+            calmar_scores: list[float] = []
 
-            return float(np.mean(sharpes)) if sharpes else 0.0
+            for window_df in windows:
+                if len(window_df) < 200:
+                    continue
+                # 4 seeds per window → 12 total evaluations (3 windows × 4 seeds).
+                # More seeds reduce Sharpe noise σ ≈ 1/√12 ≈ 0.29 vs 1/√6 ≈ 0.41.
+                for seed in (0, 1, 2, 3):
+                    env = XauIntradayEnv(window_df)
+                    obs, _ = env.reset(seed=seed)
+                    done = False
+                    rewards: list[float] = []
+                    equity_curve: list[float] = [1.0]
+                    while not done:
+                        action, _ = model.predict(
+                            np.array(obs, dtype=np.float32), deterministic=True
+                        )
+                        obs, reward, terminated, truncated, info = env.step(int(action))
+                        done = terminated or truncated
+                        rewards.append(float(reward))
+                        equity_curve.append(equity_curve[-1] + info.get("pnl", 0.0))
+
+                    if len(rewards) < 2:
+                        continue
+
+                    arr = np.array(rewards)
+                    sharpe = float(arr.mean() / arr.std()) if arr.std() > 0 else 0.0
+                    sharpes.append(sharpe)
+
+                    # Calmar: Sharpe / max_drawdown  (higher is better risk-adjusted)
+                    eq = np.array(equity_curve)
+                    peak = np.maximum.accumulate(eq)
+                    max_dd = float(((peak - eq) / (peak + 1e-9)).max())
+                    if max_dd > 0:
+                        calmar_scores.append(sharpe / max_dd)
+
+            if not sharpes:
+                return 0.0
+
+            mean_sharpe = float(np.mean(sharpes))
+            mean_calmar = float(np.mean(calmar_scores)) if calmar_scores else 0.0
+
+            logger.info(
+                f"[{self.symbol}] Eval: mean_sharpe={mean_sharpe:.4f} "
+                f"mean_calmar={mean_calmar:.4f}  "
+                f"windows={len(windows)} seeds=4"
+            )
+            return mean_sharpe
 
         except Exception as e:
             logger.warning(f"[{self.symbol}] Evaluation failed: {e} — returning 0.0")

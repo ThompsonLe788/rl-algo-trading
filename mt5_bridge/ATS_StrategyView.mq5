@@ -1,170 +1,125 @@
 //+------------------------------------------------------------------+
-//| ATS_StrategyView.mq5                                             |
-//| Visualizes the ATS strategy signals in real-time.               |
+//| ATS_StrategyView.mq5  v1.10                                      |
+//| Visualizes ATS strategy signals in real-time.                    |
 //|                                                                  |
-//| Subwindow 0 (Price chart):                                       |
+//| Main chart (chart objects on window 0):                          |
 //|   - VWAP line (session, reset daily)                             |
-//|   - ATR upper/lower bands (±1.5×ATR from VWAP)                  |
+//|   - ATR upper/lower bands (±ATRMultSL × ATR from VWAP)          |
 //|   - Signal arrows from ats_live_state.json (↑ long, ↓ short)    |
 //|                                                                  |
-//| Subwindow 1 (OU Z-Score):                                        |
-//|   - Rolling OU z-score (50-bar window)                           |
-//|   - Overbought/oversold levels at ±2.0                           |
-//|   - Zero line                                                    |
+//| Subwindow (indicator buffers):                                   |
+//|   - Rolling OU z-score (ZScoreWindow bars)                       |
+//|   - +2.0 overbought reference line                               |
+//|   - −2.0 / 0.0 drawn as horizontal objects                       |
 //|                                                                  |
-//| Background shading: grey = RANGE regime, blue = TREND regime     |
+//| Background: grey = RANGE regime, light blue = TREND regime       |
 //+------------------------------------------------------------------+
 #property copyright "XAU ATS"
 #property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
-#property indicator_chart_window
-#property indicator_buffers 6
-#property indicator_plots   5
+// Subwindow for z-score (NOT indicator_chart_window — they conflict)
+#property indicator_separate_window
+#property indicator_minimum -4.5
+#property indicator_maximum  4.5
+#property indicator_buffers 2
+#property indicator_plots   2
 
-// --- Price window plots ---
-#property indicator_label1  "VWAP"
+#property indicator_label1  "OU Z-Score"
 #property indicator_type1   DRAW_LINE
-#property indicator_color1  clrDodgerBlue
+#property indicator_color1  clrMagenta
 #property indicator_style1  STYLE_SOLID
 #property indicator_width1  2
 
-#property indicator_label2  "ATR Upper"
+#property indicator_label2  "+2 Ref"
 #property indicator_type2   DRAW_LINE
-#property indicator_color2  clrOrange
+#property indicator_color2  clrOrangeRed
 #property indicator_style2  STYLE_DOT
 #property indicator_width2  1
 
-#property indicator_label3  "ATR Lower"
-#property indicator_type3   DRAW_LINE
-#property indicator_color3  clrOrange
-#property indicator_style3  STYLE_DOT
-#property indicator_width3  1
+// ---- Buffers ----
+double ZScoreBuf[];   // OU z-score  → plotted in subwindow
+double OBBuf[];       // constant +2 reference line
 
-// --- Separate subwindow for Z-Score ---
-#property indicator_separate_window
-#property indicator_minimum -4.0
-#property indicator_maximum  4.0
+// ---- Inputs ----
+input int    ZScoreWindow = 50;
+input int    ATRPeriod    = 14;
+input double ATRMultSL    = 1.5;
+input string StateFile    = "ats_live_state.json";
+input int    RefreshSec   = 2;
+input int    VwapSegBars  = 10;   // bars per VWAP object segment (lower = smoother)
 
-#property indicator_label4  "Z-Score"
-#property indicator_type4   DRAW_LINE
-#property indicator_color4  clrMagenta
-#property indicator_style4  STYLE_SOLID
-#property indicator_width4  2
-
-#property indicator_label5  "OB Level"
-#property indicator_type5   DRAW_LINE
-#property indicator_color5  clrRed
-#property indicator_style5  STYLE_DOT
-#property indicator_width5  1
-
-// Buffers
-double VwapBuf[];
-double AtrUpperBuf[];
-double AtrLowerBuf[];
-double ZScoreBuf[];
-double OBLevel[];     // overbought +2.0
-double OSLevel[];     // oversold  -2.0 (shown via horizontal line objects)
-
-// Parameters
-input int ZScoreWindow = 50;       // Z-Score rolling window (bars)
-input int ATRPeriod    = 14;       // ATR period
-input double ATRMultSL = 1.5;      // ATR multiplier for bands
-input string StateFile = "ats_live_state.json"; // Live state JSON file
-input int RefreshSec   = 2;        // Refresh interval (seconds)
-
-// Signal tracking
+// ---- State ----
 datetime g_lastArrowTime = 0;
-int      g_lastPosition  = 0;   // last known position from JSON
+int      g_lastPosition  = 0;
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   SetIndexBuffer(0, VwapBuf,    INDICATOR_DATA);
-   SetIndexBuffer(1, AtrUpperBuf, INDICATOR_DATA);
-   SetIndexBuffer(2, AtrLowerBuf, INDICATOR_DATA);
-   SetIndexBuffer(3, ZScoreBuf,  INDICATOR_DATA);
-   SetIndexBuffer(4, OBLevel,    INDICATOR_DATA);
+   SetIndexBuffer(0, ZScoreBuf, INDICATOR_DATA);
+   SetIndexBuffer(1, OBBuf,     INDICATOR_DATA);
+   ArraySetAsSeries(ZScoreBuf, false);
+   ArraySetAsSeries(OBBuf,     false);
 
-   PlotIndexSetInteger(4, PLOT_DRAW_TYPE, DRAW_LINE);
-
-   // Second OB line is drawn as a horizontal object
-   _DrawHLine("ATS_OS", -2.0, clrLime,  1);
-   _DrawHLine("ATS_OB", +2.0, clrRed,   1);
-   _DrawHLine("ATS_Z0",  0.0, clrGray,  0);
+   // Horizontal reference lines in the subwindow
+   int sw = ChartWindowFind(0, IndicatorSetString(INDICATOR_SHORTNAME,
+            StringFormat("ATS View [Z%d ATR%d]", ZScoreWindow, ATRPeriod)));
+   _HLine("ATS_OB",  2.0, clrOrangeRed, STYLE_DOT,   sw);
+   _HLine("ATS_OS", -2.0, clrLime,      STYLE_DOT,   sw);
+   _HLine("ATS_Z0",  0.0, clrGray,      STYLE_SOLID, sw);
 
    EventSetTimer(RefreshSec);
-
-   IndicatorSetString(INDICATOR_SHORTNAME,
-     StringFormat("ATS Strategy [Z%d ATR%d]", ZScoreWindow, ATRPeriod));
-
    return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   ObjectDelete(0, "ATS_OS");
-   ObjectDelete(0, "ATS_OB");
-   ObjectDelete(0, "ATS_Z0");
    EventKillTimer();
+   ObjectDelete(0, "ATS_OB");
+   ObjectDelete(0, "ATS_OS");
+   ObjectDelete(0, "ATS_Z0");
+   _DeletePrefix("ATS_VW_");
+   _DeletePrefix("ATS_AU_");
+   _DeletePrefix("ATS_AL_");
+   _DeletePrefix("ATS_SIG_");
   }
 
 //+------------------------------------------------------------------+
 int OnCalculate(const int rates_total,
                 const int prev_calculated,
                 const datetime &time[],
-                const double &open[],
-                const double &high[],
-                const double &low[],
-                const double &close[],
-                const long &tick_volume[],
-                const long &volume[],
-                const int &spread[])
+                const double   &open[],
+                const double   &high[],
+                const double   &low[],
+                const double   &close[],
+                const long     &tick_volume[],
+                const long     &volume[],
+                const int      &spread[])
   {
    int start = MathMax(prev_calculated - 1, ZScoreWindow + ATRPeriod + 1);
-   if(start < 0) start = 0;
+   if(start >= rates_total) return rates_total;
 
-   // --- 1. VWAP (resets daily) ---
-   datetime curDate = 0;
-   double   cumPV   = 0, cumVol = 0;
-   for(int i = 0; i < rates_total; i++)
-     {
-      datetime dayStart = (datetime)(MathFloor((double)time[i] / 86400.0) * 86400);
-      if(dayStart != curDate)
-        { curDate = dayStart; cumPV = 0; cumVol = 0; }
-      double tv = (double)tick_volume[i];
-      if(tv < 1) tv = 1;
-      cumPV  += close[i] * tv;
-      cumVol += tv;
-      VwapBuf[i] = cumPV / cumVol;
-     }
-
-   // --- 2. ATR bands ---
+   // ---- 1. OU Z-Score (subwindow buffer) ----
    for(int i = start; i < rates_total; i++)
      {
-      double atr = _ATR(i, ATRPeriod, high, low, close, rates_total);
-      AtrUpperBuf[i] = VwapBuf[i] + ATRMultSL * atr;
-      AtrLowerBuf[i] = VwapBuf[i] - ATRMultSL * atr;
-     }
-
-   // --- 3. OU Z-Score ---
-   for(int i = start; i < rates_total; i++)
-     {
-      if(i < ZScoreWindow) { ZScoreBuf[i] = 0; continue; }
-      double sum = 0, sum2 = 0;
-      for(int j = i - ZScoreWindow + 1; j <= i; j++)
-          sum += close[j];
+      if(i < ZScoreWindow) { ZScoreBuf[i] = 0; OBBuf[i] = 2.0; continue; }
+      double sum = 0;
+      for(int j = i - ZScoreWindow + 1; j <= i; j++) sum += close[j];
       double mu = sum / ZScoreWindow;
-      for(int j = i - ZScoreWindow + 1; j <= i; j++)
-          sum2 += (close[j] - mu) * (close[j] - mu);
-      double sigma = MathSqrt(sum2 / ZScoreWindow);
-      ZScoreBuf[i] = (sigma > 1e-9) ? (close[i] - mu) / sigma : 0;
-      OBLevel[i]   = 2.0;   // constant +2 reference
+      double sq = 0;
+      for(int j = i - ZScoreWindow + 1; j <= i; j++) sq += (close[j]-mu)*(close[j]-mu);
+      double sigma = MathSqrt(sq / ZScoreWindow);
+      ZScoreBuf[i] = (sigma > 1e-9) ? (close[i] - mu) / sigma : 0.0;
+      OBBuf[i]     = 2.0;
      }
 
-   // --- 4. Background regime shading from live state ---
+   // ---- 2. VWAP + ATR bands on main chart as trend-line objects ----
+   _UpdateVwapObjects(time, close, high, low, tick_volume,
+                      rates_total, prev_calculated);
+
+   // ---- 3. Regime background from JSON ----
    _UpdateRegimeBackground();
 
    return rates_total;
@@ -173,15 +128,192 @@ int OnCalculate(const int rates_total,
 //+------------------------------------------------------------------+
 void OnTimer()
   {
-   // Poll signal file and draw new arrows at current bar
    _DrawSignalArrows();
    ChartRedraw();
   }
 
 //+------------------------------------------------------------------+
-// Helpers
+// Draw/update VWAP + ATR band chart objects on window 0.
+// Segments every VwapSegBars bars for performance.
 //+------------------------------------------------------------------+
+void _UpdateVwapObjects(const datetime &time[],
+                        const double   &close[],
+                        const double   &high[],
+                        const double   &low[],
+                        const long     &tv[],
+                        int total, int prev_calc)
+  {
+   // Full recalc: remove all existing ATS VWAP/ATR objects
+   if(prev_calc == 0)
+     {
+      _DeletePrefix("ATS_VW_");
+      _DeletePrefix("ATS_AU_");
+      _DeletePrefix("ATS_AL_");
+     }
 
+   // Compute VWAP for all bars (daily reset)
+   double vwap[];
+   ArrayResize(vwap, total);
+   double cumPV = 0, cumVol = 0;
+   datetime curDay = 0;
+   for(int i = 0; i < total; i++)
+     {
+      datetime d = (datetime)(MathFloor((double)time[i] / 86400.0) * 86400);
+      if(d != curDay) { curDay = d; cumPV = 0; cumVol = 0; }
+      double v = (double)tv[i]; if(v < 1) v = 1;
+      cumPV  += close[i] * v;
+      cumVol += v;
+      vwap[i] = cumPV / cumVol;
+     }
+
+   // Starting segment index (partial update starts a few segments back)
+   int seg0 = (prev_calc > VwapSegBars * 3)
+              ? ((prev_calc / VwapSegBars) - 2) * VwapSegBars
+              : 0;
+   seg0 = MathMax(seg0, ATRPeriod);
+
+   for(int i = seg0; i < total - 1; i += VwapSegBars)
+     {
+      int j = MathMin(i + VwapSegBars, total - 1);
+      double atrI = _ATR(i, ATRPeriod, high, low, close, total);
+      double atrJ = _ATR(j, ATRPeriod, high, low, close, total);
+
+      _TrendObj(StringFormat("ATS_VW_%d", i),
+                time[i], vwap[i],
+                time[j], vwap[j],
+                clrDodgerBlue, 2);
+      _TrendObj(StringFormat("ATS_AU_%d", i),
+                time[i], vwap[i] + ATRMultSL * atrI,
+                time[j], vwap[j] + ATRMultSL * atrJ,
+                clrOrange, 1);
+      _TrendObj(StringFormat("ATS_AL_%d", i),
+                time[i], vwap[i] - ATRMultSL * atrI,
+                time[j], vwap[j] - ATRMultSL * atrJ,
+                clrOrange, 1);
+     }
+  }
+
+//+------------------------------------------------------------------+
+// Create or update a non-extending OBJ_TREND on window 0.
+//+------------------------------------------------------------------+
+void _TrendObj(const string name,
+               datetime t1, double p1,
+               datetime t2, double p2,
+               color clr, int width)
+  {
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_TREND, 0, t1, p1, t2, p2);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 0, p1);
+   ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+   ObjectSetDouble (0, name, OBJPROP_PRICE, 1, p2);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       clr);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,       width);
+   ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT,   false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,      false);
+   ObjectSetInteger(0, name, OBJPROP_BACK,        true);
+  }
+
+//+------------------------------------------------------------------+
+// Read ats_live_state.json (FILE_BIN — safe for multi-line JSON).
+// Draw an arrow when position changes.
+//+------------------------------------------------------------------+
+void _DrawSignalArrows()
+  {
+   string raw = _ReadJsonFile(StateFile);
+   if(StringLen(raw) == 0) return;
+
+   // Find this symbol's block
+   int symPos = StringFind(raw, "\"" + _Symbol + "\"");
+   if(symPos < 0) return;
+   string chunk = StringSubstr(raw, symPos, 500);
+
+   int posKey = StringFind(chunk, "\"position\":");
+   if(posKey < 0) return;
+   string posStr = StringSubstr(chunk, posKey + 11, 4);
+   StringTrimLeft(posStr); StringTrimRight(posStr);
+   int newPos = (int)StringToInteger(StringSubstr(posStr, 0, 2));
+
+   if(newPos == g_lastPosition) return;
+
+   datetime t = TimeCurrent();
+   if(t == g_lastArrowTime) return;
+
+   double price  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   string aname  = StringFormat("ATS_SIG_%I64d", (long)t);
+
+   if(newPos == 1)         // Long — up arrow below price
+     {
+      ObjectCreate(0, aname, OBJ_ARROW, 0, t, price * 0.9999);
+      ObjectSetInteger(0, aname, OBJPROP_ARROWCODE, 233);
+      ObjectSetInteger(0, aname, OBJPROP_COLOR,     clrLime);
+      ObjectSetInteger(0, aname, OBJPROP_WIDTH,     3);
+     }
+   else if(newPos == -1)   // Short — down arrow above price
+     {
+      ObjectCreate(0, aname, OBJ_ARROW, 0, t, price * 1.0001);
+      ObjectSetInteger(0, aname, OBJPROP_ARROWCODE, 234);
+      ObjectSetInteger(0, aname, OBJPROP_COLOR,     clrRed);
+      ObjectSetInteger(0, aname, OBJPROP_WIDTH,     3);
+     }
+   else if(newPos == 0 && g_lastPosition != 0)   // Closed — circle
+     {
+      ObjectCreate(0, aname, OBJ_ARROW, 0, t, price);
+      ObjectSetInteger(0, aname, OBJPROP_ARROWCODE, 159);
+      ObjectSetInteger(0, aname, OBJPROP_COLOR,     clrYellow);
+      ObjectSetInteger(0, aname, OBJPROP_WIDTH,     2);
+     }
+
+   if(ObjectFind(0, aname) >= 0)
+     {
+      ObjectSetInteger(0, aname, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, aname, OBJPROP_HIDDEN,     false);
+     }
+
+   g_lastPosition  = newPos;
+   g_lastArrowTime = t;
+  }
+
+//+------------------------------------------------------------------+
+// Read JSON and tint chart background by regime (0=Range, 1=Trend).
+//+------------------------------------------------------------------+
+void _UpdateRegimeBackground()
+  {
+   string raw = _ReadJsonFile(StateFile);
+   if(StringLen(raw) == 0) return;
+
+   int symPos = StringFind(raw, "\"" + _Symbol + "\"");
+   if(symPos < 0) return;
+   string chunk  = StringSubstr(raw, symPos, 300);
+   int    regKey = StringFind(chunk, "\"regime\":");
+   if(regKey < 0) return;
+   int regime = (int)StringToInteger(StringSubstr(chunk, regKey + 9, 2));
+
+   color bg = (regime == 1) ? C'220,235,255' : C'240,240,240';
+   ChartSetInteger(0, CHART_COLOR_BACKGROUND, bg);
+  }
+
+//+------------------------------------------------------------------+
+// Read a Common Files JSON using FILE_BIN (avoids FILE_TXT newline
+// truncation that broke ATS_Panel earlier).
+//+------------------------------------------------------------------+
+string _ReadJsonFile(const string filename)
+  {
+   int fh = FileOpen(filename, FILE_READ | FILE_BIN | FILE_COMMON);
+   if(fh == INVALID_HANDLE) return "";
+   ulong size = FileSize(fh);
+   if(size == 0) { FileClose(fh); return ""; }
+   uchar buf[];
+   ArrayResize(buf, (int)size);
+   FileReadArray(fh, buf, 0, (int)size);
+   FileClose(fh);
+   return CharArrayToString(buf, 0, (int)size, CP_UTF8);
+  }
+
+//+------------------------------------------------------------------+
+// Simple ATR (SMA of True Range, no Wilder smoothing).
+//+------------------------------------------------------------------+
 double _ATR(int idx, int period,
             const double &high[], const double &low[], const double &close[],
             int total)
@@ -202,109 +334,32 @@ double _ATR(int idx, int period,
   }
 
 //+------------------------------------------------------------------+
-void _DrawHLine(const string name, double price,
-                color clr, int style)
+// Create a horizontal line object in the given subwindow.
+//+------------------------------------------------------------------+
+void _HLine(const string name, double price, color clr, int style, int sw)
   {
+   if(sw < 0) sw = 1;
    if(ObjectFind(0, name) < 0)
-      ObjectCreate(0, name, OBJ_HLINE, 1, 0, price);  // subwindow 1
-   ObjectSetDouble(0, name, OBJPROP_PRICE, price);
-   ObjectSetInteger(0, name, OBJPROP_COLOR,    clr);
-   ObjectSetInteger(0, name, OBJPROP_STYLE,    style);
-   ObjectSetInteger(0, name, OBJPROP_WIDTH,    1);
+      ObjectCreate(0, name, OBJ_HLINE, sw, 0, price);
+   ObjectSetDouble (0, name, OBJPROP_PRICE,      price);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,      clr);
+   ObjectSetInteger(0, name, OBJPROP_STYLE,      style);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,      1);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN,   true);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
   }
 
 //+------------------------------------------------------------------+
-void _DrawSignalArrows()
+// Delete all chart objects whose names start with a given prefix.
+//+------------------------------------------------------------------+
+void _DeletePrefix(const string prefix)
   {
-   // Read ats_live_state.json from MT5 Common Files
-   string path = StateFile;
-   int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_COMMON | FILE_ANSI);
-   if(fh == INVALID_HANDLE) return;
-
-   string raw = "";
-   while(!FileIsEnding(fh))
-      raw += FileReadString(fh);
-   FileClose(fh);
-
-   // Parse "position": X for this symbol
-   string symKey = "\"" + _Symbol + "\"";
-   int symPos = StringFind(raw, symKey);
-   if(symPos < 0) return;
-
-   string chunk = StringSubstr(raw, symPos, 400);
-   int posKey = StringFind(chunk, "\"position\":");
-   if(posKey < 0) return;
-
-   string posStr = StringSubstr(chunk, posKey + 11, 4);
-   StringTrimLeft(posStr); StringTrimRight(posStr);
-   int newPos = (int)StringToInteger(StringSubstr(posStr, 0, 2));
-
-   // Only draw arrow on position CHANGE
-   if(newPos == g_lastPosition) return;
-
-   datetime t = TimeCurrent();
-   if(t == g_lastArrowTime) return;  // already drew this bar
-
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   string arrowName = StringFormat("ATS_SIG_%I64d", (long)t);
-
-   if(newPos == 1)
-     {  // Long signal — up arrow below bar
-      ObjectCreate(0, arrowName, OBJ_ARROW, 0, t, price * 0.9999);
-      ObjectSetInteger(0, arrowName, OBJPROP_ARROWCODE, 233);   // ↑
-      ObjectSetInteger(0, arrowName, OBJPROP_COLOR,    clrLime);
-      ObjectSetInteger(0, arrowName, OBJPROP_WIDTH,    3);
-     }
-   else if(newPos == -1)
-     {  // Short signal — down arrow above bar
-      ObjectCreate(0, arrowName, OBJ_ARROW, 0, t, price * 1.0001);
-      ObjectSetInteger(0, arrowName, OBJPROP_ARROWCODE, 234);   // ↓
-      ObjectSetInteger(0, arrowName, OBJPROP_COLOR,    clrRed);
-      ObjectSetInteger(0, arrowName, OBJPROP_WIDTH,    3);
-     }
-   else if(newPos == 0 && g_lastPosition != 0)
-     {  // Position closed — circle
-      ObjectCreate(0, arrowName, OBJ_ARROW, 0, t, price);
-      ObjectSetInteger(0, arrowName, OBJPROP_ARROWCODE, 159);   // ○
-      ObjectSetInteger(0, arrowName, OBJPROP_COLOR,    clrYellow);
-      ObjectSetInteger(0, arrowName, OBJPROP_WIDTH,    2);
-     }
-
-   if(ObjectFind(0, arrowName) >= 0)
+   int total = ObjectsTotal(0, 0, -1);
+   for(int k = total - 1; k >= 0; k--)
      {
-      ObjectSetInteger(0, arrowName, OBJPROP_SELECTABLE, false);
-      ObjectSetInteger(0, arrowName, OBJPROP_HIDDEN,  false);
+      string nm = ObjectName(0, k, 0, -1);
+      if(StringFind(nm, prefix) == 0)
+         ObjectDelete(0, nm);
      }
-
-   g_lastPosition  = newPos;
-   g_lastArrowTime = t;
-  }
-
-//+------------------------------------------------------------------+
-void _UpdateRegimeBackground()
-  {
-   string path = StateFile;
-   int fh = FileOpen(path, FILE_READ | FILE_TXT | FILE_COMMON | FILE_ANSI);
-   if(fh == INVALID_HANDLE) return;
-
-   string raw = "";
-   while(!FileIsEnding(fh))
-      raw += FileReadString(fh);
-   FileClose(fh);
-
-   // Parse "regime": X for this symbol
-   string symKey = "\"" + _Symbol + "\"";
-   int symPos = StringFind(raw, symKey);
-   if(symPos < 0) return;
-   string chunk = StringSubstr(raw, symPos, 300);
-   int regKey = StringFind(chunk, "\"regime\":");
-   if(regKey < 0) return;
-   int regime = (int)StringToInteger(StringSubstr(chunk, regKey + 9, 2));
-
-   // 0=RANGE (grey bg), 1=TREND (light blue bg)
-   color bgColor = (regime == 1) ? C'220,235,255' : C'240,240,240';
-   ChartSetInteger(0, CHART_COLOR_BACKGROUND, bgColor);
   }
 //+------------------------------------------------------------------+

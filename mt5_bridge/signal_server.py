@@ -13,6 +13,7 @@ import math
 import time
 import logging
 import threading
+from collections import deque
 import zmq
 import numpy as np
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import ZMQ_SIGNAL_ADDR, EOD_HOUR_GMT, LOG_DIR, LIVE_STATE_PATH, get_symbol_config
 from risk.kelly import KellyPositionSizer, vwap_slice_orders
 from risk.kill_switch import KillSwitch
+from risk.news_filter import NewsFilter
 
 logger = logging.getLogger("signal_server")
 _handler = logging.FileHandler(LOG_DIR / "signal_server.log")
@@ -36,6 +38,9 @@ logger.setLevel(logging.INFO)
 # ---------------------------------------------------------------------------
 class LiveStateWriter:
     """Writes a single live_state.json used by the monitoring stack.
+
+    Singleton: all SignalServer instances share one writer so multi-symbol
+    state accumulates correctly instead of each worker overwriting the file.
 
     Structure:
     {
@@ -52,6 +57,39 @@ class LiveStateWriter:
     Mirrors to MT5 Common Files path so ATS_Panel.mq5 can read it.
     """
 
+    _instance: "LiveStateWriter | None" = None
+    _instance_lock = threading.Lock()
+    _active_servers: int = 0          # ref-count for alive tracking
+    _total_signal_count: int = 0      # aggregate across all servers
+
+    @classmethod
+    def instance(cls, **kwargs) -> "LiveStateWriter":
+        """Return singleton instance (thread-safe lazy init)."""
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls(**kwargs)
+            return cls._instance
+
+    def register_server(self):
+        """Track active server count for alive status."""
+        with self.__class__._instance_lock:
+            self.__class__._active_servers += 1
+
+    def unregister_server(self) -> bool:
+        """Decrement server count. Returns True if this was the last server."""
+        with self.__class__._instance_lock:
+            self.__class__._active_servers = max(0, self.__class__._active_servers - 1)
+            return self.__class__._active_servers == 0
+
+    def add_signals(self, count: int = 1):
+        """Thread-safe increment of total signal count across all servers."""
+        with self.__class__._instance_lock:
+            self.__class__._total_signal_count += count
+
+    @property
+    def total_signals(self) -> int:
+        return self.__class__._total_signal_count
+
     def __init__(
         self,
         log_path: Path | None = None,
@@ -66,12 +104,14 @@ class LiveStateWriter:
         # Ensure parent directories exist once at construction time
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._mt5_path.parent.mkdir(parents=True, exist_ok=True)
+        _now = datetime.now(timezone.utc)
         self._state: dict = {
             "_account": {"equity": 0.0, "balance": 0.0, "drawdown_pct": 0.0},
             "_system": {
                 "alive": True, "killed": False,
                 "signal_count": 0, "kill_reason": "",
-                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "last_heartbeat": _now.isoformat(),
+                "unix_time": int(_now.timestamp()),
             },
         }
         self._lock = threading.Lock()
@@ -90,7 +130,16 @@ class LiveStateWriter:
         last_signal: dict | None = None,
     ):
         with self._lock:
-            self._state[symbol.upper()] = {
+            sym = symbol.upper()
+            existing = self._state.get(sym, {})
+            # Preserve model / history fields written by update_model() and
+            # add_signal_to_history() — do NOT overwrite them on every tick.
+            _PRESERVE = (
+                "model_version", "is_training", "last_retrain_time",
+                "last_retrain_reason", "win_rate", "total_trades",
+                "model_sharpe", "signals_history",
+            )
+            new_state = {
                 "position": position,
                 "entry_price": entry_price,
                 "unrealized_pnl": round(unrealized_pnl, 4),
@@ -100,14 +149,97 @@ class LiveStateWriter:
                 "last_signal": last_signal or {},
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
+            for key in _PRESERVE:
+                if key in existing:
+                    new_state[key] = existing[key]
+            self._state[sym] = new_state
             self._dirty = True
 
-    def update_account(self, equity: float, balance: float, drawdown_pct: float):
+    def update_model(
+        self,
+        symbol: str,
+        *,
+        version: str | None = None,
+        is_training: bool | None = None,
+        last_retrain_time: str | None = None,
+        last_retrain_reason: str | None = None,
+        win_rate: float | None = None,
+        total_trades: int | None = None,
+        sharpe: float | None = None,
+    ) -> None:
+        """Merge AI-model / retrain stats into the symbol's state entry.
+
+        Only fields explicitly passed (non-None) are written; existing values
+        are preserved for omitted fields.
+        """
+        with self._lock:
+            sym = symbol.upper()
+            if sym not in self._state:
+                self._state[sym] = {}
+            if version is not None:
+                self._state[sym]["model_version"] = version
+            if is_training is not None:
+                self._state[sym]["is_training"] = is_training
+            if last_retrain_time is not None:
+                self._state[sym]["last_retrain_time"] = last_retrain_time
+            if last_retrain_reason is not None:
+                self._state[sym]["last_retrain_reason"] = last_retrain_reason
+            if win_rate is not None:
+                self._state[sym]["win_rate"] = round(win_rate, 4)
+            if total_trades is not None:
+                self._state[sym]["total_trades"] = total_trades
+            if sharpe is not None:
+                self._state[sym]["model_sharpe"] = round(sharpe, 4)
+            self._dirty = True
+
+    def add_signal_to_history(
+        self, symbol: str, side: int, price: float,
+        win_prob: float, lot: float, rr: float,
+    ) -> None:
+        """Prepend signal to rolling history (max 5); newest first."""
+        with self._lock:
+            sym = symbol.upper()
+            if sym not in self._state:
+                self._state[sym] = {}
+            hist = list(self._state[sym].get("signals_history", []))
+            entry = {
+                "s": side,                              # 1=buy,-1=sell,0=close
+                "p": round(price, 2),
+                "w": round(win_prob, 4),
+                "l": round(lot, 2),
+                "r": round(rr, 2),
+                "t": datetime.now(timezone.utc).strftime("%H:%M"),
+            }
+            hist.insert(0, entry)
+            self._state[sym]["signals_history"] = hist[:5]
+            self._dirty = True
+
+    def update_account(
+        self,
+        equity: float,
+        balance: float,
+        drawdown_pct: float,
+        *,
+        daily_loss_usd: float = 0.0,
+        max_loss_usd: float = 0.0,
+        profit_usd: float = 0.0,
+        daily_loss_limit_usd: float = 0.0,
+        max_loss_limit_usd: float = 0.0,
+        profit_target_usd: float = 0.0,
+        initial_balance: float = 0.0,
+    ):
         with self._lock:
             self._state["_account"] = {
                 "equity": round(equity, 2),
                 "balance": round(balance, 2),
                 "drawdown_pct": round(drawdown_pct, 4),
+                "daily_loss_usd": round(daily_loss_usd, 2),
+                "max_loss_usd": round(max_loss_usd, 2),
+                "profit_usd": round(profit_usd, 2),
+                "daily_loss_limit_usd": round(daily_loss_limit_usd, 2),
+                "max_loss_limit_usd": round(max_loss_limit_usd, 2),
+                "profit_target_usd": round(profit_target_usd, 2),
+                "initial_balance": round(initial_balance, 2),
             }
             self._dirty = True
 
@@ -119,12 +251,14 @@ class LiveStateWriter:
         kill_reason: str = "",
     ):
         with self._lock:
+            now = datetime.now(timezone.utc)
             self._state["_system"] = {
                 "alive": alive,
                 "killed": killed,
                 "signal_count": signal_count,
                 "kill_reason": kill_reason,
-                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "last_heartbeat": now.isoformat(),
+                "unix_time": int(now.timestamp()),
             }
             self._dirty = True
 
@@ -146,6 +280,10 @@ class LiveStateWriter:
         with self._lock:
             if not self._dirty:
                 return
+            # Always stamp heartbeat on flush so panel sees fresh unix_time
+            _now = datetime.now(timezone.utc)
+            self._state["_system"]["last_heartbeat"] = _now.isoformat()
+            self._state["_system"]["unix_time"] = int(_now.timestamp())
             payload = json.dumps(_sanitize(self._state))
             self._dirty = False
 
@@ -238,13 +376,31 @@ class SignalServer:
             self._lock = threading.Lock()
 
         self.addr = addr
-        self.kelly = KellyPositionSizer()
+        self.kelly = KellyPositionSizer(symbol=self.symbol)
         sym_cfg = get_symbol_config(self.symbol)
         self._contract_size = sym_cfg["contract_size"]
         self._atr_mult_sl   = sym_cfg["atr_mult_sl"]
-        self.kill_switch = KillSwitch()
+        self._price_digits  = sym_cfg.get("price_digits", 5)
+        self._max_lot       = sym_cfg.get("max_lot", 10.0)
+        self._spread_bps    = sym_cfg["spread_bps"]
+
+        # News filter: shared singleton — one HTTP calendar for all symbols
+        self._news_filter = NewsFilter()
+
+        # Kill switch: wired with news filter + session filter
+        self.kill_switch = KillSwitch(
+            news_filter=self._news_filter,
+            symbol=self.symbol,
+            session_filter=True,
+        )
+
+        # Spread monitoring: rolling history of recent spreads
+        # Block entry when current_spread > SPREAD_SPIKE_MULT × rolling average
+        self._spread_history: deque[float] = deque(maxlen=200)
+        self._spread_spike_mult: float = 3.0   # 3× normal spread = skip
         self._signal_count = 0
-        self.state_writer = LiveStateWriter()
+        self.state_writer = LiveStateWriter.instance()
+        self.state_writer.register_server()
 
         # Heartbeat thread
         self._hb_interval = heartbeat_interval
@@ -282,12 +438,27 @@ class SignalServer:
                 self.state_writer.update_system(
                     alive=True,
                     killed=self.kill_switch.is_killed,
-                    signal_count=self._signal_count,
+                    signal_count=self.state_writer.total_signals,
                     kill_reason=self.kill_switch.kill_reason,
                 )
+                # Refresh model_version every heartbeat so panel always shows it
+                try:
+                    from config import MODEL_DIR as _MD
+                    _ckpt = _MD / f"ppo_{self.symbol.lower()}.zip"
+                    _ver  = f"ppo_{self.symbol.lower()}"
+                    if _ckpt.exists():
+                        from datetime import datetime as _dt2
+                        _mt = _dt2.fromtimestamp(_ckpt.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                        _ver = f"ppo_{self.symbol.lower()} [{_mt}]"
+                    self.state_writer.update_model(self.symbol, version=_ver, is_training=False)
+                except Exception:
+                    pass
                 self.state_writer.flush()
-            except zmq.ZMQError:
-                pass
+            except zmq.ZMQError as _e:
+                # EAGAIN = socket would block (transient) — safe to ignore.
+                # Any other error means the socket is in trouble; log it.
+                if _e.errno != zmq.EAGAIN:
+                    logger.warning("Heartbeat ZMQ error (errno=%d): %s", _e.errno, _e)
             self._hb_stop.wait(self._hb_interval)
 
     def publish(self, signal: Signal):
@@ -296,12 +467,35 @@ class SignalServer:
         with self._lock:
             self.socket.send(msg)
             self._signal_count += 1
+        self.state_writer.add_signals(1)
         logger.info(
             f"[#{self._signal_count}] {self.symbol} Published: side={signal.side} "
             f"price={signal.price} lot={signal.lot} regime={signal.regime}"
         )
         if self._file_writer:
             self._file_writer.write(signal)
+
+    def _update_spread(self, spread: float) -> bool:
+        """Record spread and return True if it is within normal range.
+
+        A spike (current > SPREAD_SPIKE_MULT × rolling mean) returns False,
+        which causes generate_signal() to block new entries.
+        Spread tracking is always updated regardless of outcome.
+        """
+        if spread > 0:
+            self._spread_history.append(spread)
+        if len(self._spread_history) < 10:
+            return True          # not enough history — allow through
+        avg = float(np.mean(self._spread_history))
+        if avg <= 0:
+            return True
+        is_normal = spread <= avg * self._spread_spike_mult
+        if not is_normal:
+            logger.warning(
+                f"[{self.symbol}] Spread spike: {spread:.5f} > {self._spread_spike_mult}× "
+                f"avg {avg:.5f} — skipping entry"
+            )
+        return is_normal
 
     def generate_signal(
         self,
@@ -314,6 +508,7 @@ class SignalServer:
         atr_mult_sl: float | None = None,
         current_position: int = 0,
         entry_price: float = 0.0,
+        current_spread: float = 0.0,   # live bid-ask spread for spike check
     ) -> Signal | None:
         """Generate a signal from RL agent action.
 
@@ -323,10 +518,21 @@ class SignalServer:
         """
         if atr_mult_sl is None:
             atr_mult_sl = self._atr_mult_sl
+
+        # Spread spike guard — update history and check before kill_switch
+        spread_ok = self._update_spread(current_spread)
+
         status = self.kill_switch.check(account_equity)
 
-        # Update shared live state every call
-        unrealized = current_position * (mid_price - entry_price) if entry_price else 0.0
+        # Unrealised P&L — mark at the exit side (bid for longs, ask for shorts)
+        # so the dashboard reflects what we'd actually receive if we closed now.
+        # half_spread is derived from per-symbol spread_bps config.
+        if entry_price and current_position != 0:
+            half_spread = mid_price * (self._spread_bps / 10_000) / 2
+            mark_price = mid_price - current_position * half_spread
+            unrealized = current_position * (mark_price - entry_price)
+        else:
+            unrealized = 0.0
         self.state_writer.update_symbol(
             self.symbol,
             position=current_position,
@@ -352,6 +558,10 @@ class SignalServer:
         if not status["allow_new_trades"] and action in (1, 2):
             return None
 
+        # Spread spike: skip new entries only (allow close/hold)
+        if not spread_ok and action in (1, 2):
+            return None
+
         if action == 0:
             return None
         if action == 3:
@@ -374,12 +584,14 @@ class SignalServer:
             sl_distance=sl_dist,
             contract_size=self._contract_size,
         )
+        lot = min(lot, self._max_lot)   # per-symbol hard cap
 
+        d = self._price_digits
         sig = Signal(
             side=side,
-            price=round(mid_price, 2),
-            sl=round(sl, 2),
-            tp=round(tp, 2),
+            price=round(mid_price, d),
+            sl=round(sl, d),
+            tp=round(tp, d),
             lot=lot,
             regime=regime,
             z_score=round(z_score, 4),
@@ -387,7 +599,7 @@ class SignalServer:
             rr=round(rr, 2),
             symbol=self.symbol,
         )
-        # Update last_signal in live state
+        # Update last_signal + rolling signals history in live state
         self.state_writer.update_symbol(
             self.symbol,
             position=side,
@@ -398,6 +610,10 @@ class SignalServer:
             drawdown_pct=status["drawdown_pct"],
             last_signal=sig.__dict__,
         )
+        self.state_writer.add_signal_to_history(
+            self.symbol, side=side, price=mid_price,
+            win_prob=self.kelly.win_rate, lot=lot, rr=rr,
+        )
         self.state_writer.flush()
         return sig
 
@@ -405,11 +621,13 @@ class SignalServer:
         """Shutdown server: stop heartbeat, close socket (only if owned)."""
         self._hb_stop.set()
         self._hb_thread.join(timeout=2)
-        self.state_writer.update_system(
-            alive=False, killed=self.kill_switch.is_killed,
-            signal_count=self._signal_count,
-        )
-        self.state_writer.flush()
+        is_last = self.state_writer.unregister_server()
+        if is_last:
+            self.state_writer.update_system(
+                alive=False, killed=self.kill_switch.is_killed,
+                signal_count=self.state_writer.total_signals,
+            )
+            self.state_writer.flush()
         if self._owns_socket:
             with self._lock:
                 self.socket.close()
@@ -499,14 +717,19 @@ def run_live_loop(
                 try:
                     feat_df    = build_feature_matrix(_to_ohlc(df_window))
                     _z_cache   = float(feat_df["z_score"].iloc[-1])
-                    # Combine astype + nan_to_num in one pass (BUG-14)
                     _obs_cache = np.nan_to_num(
                         feat_df.values[-1], nan=0.0, posinf=0.0, neginf=0.0
                     ).astype(np.float32, copy=False)
+                    # Feed realized vol to Kelly for volatility regime sizing (⑩)
+                    if "rvol" in feat_df.columns:
+                        rvol_val = float(feat_df["rvol"].iloc[-1])
+                        server.kelly.update_rvol(rvol_val)
                 except Exception:
                     pass  # keep previous cache on error
 
-            regime = (regime_model.predict(df_window.iloc[-50:].values)
+            # Use iloc[-51:-1] to exclude the current open (unfinished) bar
+            # and use only the last 50 fully closed bars — avoids look-ahead bias.
+            regime = (regime_model.predict(df_window.iloc[-51:-1].values)
                       if regime_model else 0)
 
             action, _ = model.predict(_obs_cache, deterministic=True)

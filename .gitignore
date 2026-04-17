@@ -49,3 +49,4 @@ logs/tb/
 
 # External dependencies (install separately — see README)
 _deps/
+.claude/settings.local.json

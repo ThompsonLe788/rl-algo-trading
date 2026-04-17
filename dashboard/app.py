@@ -554,19 +554,19 @@ def _dashboard() -> None:
             with ch1:
                 fig = _equity_chart(list(st.session_state.equity_history))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True, key=f"eq_{sym}")
+                    st.plotly_chart(fig, width="stretch", key=f"eq_{sym}")
                 else:
                     st.info("Equity curve builds as session progresses.")
             with ch2:
                 fig = _pnl_chart(sym, list(st.session_state.pnl_history.get(sym, [])))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True, key=f"pnl_{sym}")
+                    st.plotly_chart(fig, width="stretch", key=f"pnl_{sym}")
                 else:
                     st.info("P&L chart builds with tick data.")
             with ch3:
                 fig = _z_chart(sym, list(st.session_state.z_history.get(sym, [])))
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True, key=f"z_{sym}")
+                    st.plotly_chart(fig, width="stretch", key=f"z_{sym}")
                 else:
                     st.info("Z-score chart builds with signal data.")
 
@@ -722,7 +722,7 @@ def _dashboard() -> None:
                 '<div class="banner banner-waiting">'
                 '<span class="badge badge-waiting">⚪ WAITING</span>'
                 '<span style="margin-left:10px;color:#8b949e;">'
-                'No active workers — run <code>python main.py multi-live</code> '
+                'No active workers — run <code>python start.py</code> '
                 'and open an MT5 chart.'
                 '</span></div>',
                 unsafe_allow_html=True,
@@ -737,10 +737,15 @@ def _dashboard() -> None:
             fig_g = go.Figure(go.Indicator(
                 mode="gauge+number",
                 value=dd_v,
-                title={"text": "Account Drawdown %"},
+                title={"text": "Account Drawdown %",
+                       "font": {"color": "#e6edf3", "size": 14}},
+                number={"font": {"color": "#e6edf3", "size": 36}},
                 gauge={
-                    "axis": {"range": [0, 20]},
+                    "axis": {"range": [0, 20],
+                             "tickfont": {"color": "#8b949e"}},
                     "bar": {"color": g_clr},
+                    "bgcolor": "#161b22",
+                    "bordercolor": "#30363d",
                     "steps": [
                         {"range": [0,  5],  "color": "#1a3a1a"},
                         {"range": [5,  10], "color": "#3a2a1a"},
@@ -752,13 +757,57 @@ def _dashboard() -> None:
             ))
             fig_g.update_layout(
                 height=260,
-                margin=dict(l=20, r=20, t=40, b=20),
+                margin=dict(l=20, r=20, t=50, b=20),
                 paper_bgcolor="#0d1117",
                 font=dict(color="#e6edf3"),
             )
-            st.plotly_chart(fig_g, use_container_width=True)
+            st.plotly_chart(fig_g, width="stretch")
         with g2:
-            st.json(state.account, expanded=True)
+            acct = state.account
+            eq_v  = acct.get("equity", 0)
+            bal_v = acct.get("balance", 0)
+            dd_a  = acct.get("drawdown_pct", 0)
+            pnl_v = eq_v - bal_v
+
+            pnl_c = "#3fb950" if pnl_v >= 0 else "#f85149"
+            dd_c2 = "#3fb950" if dd_a < 5 else ("#d29922" if dd_a < 10 else "#f85149")
+
+            st.markdown(f"""
+<div style="display:flex; flex-direction:column; gap:10px; padding:4px 0;">
+  <div style="display:flex; gap:10px;">
+    <div style="flex:1; background:#161b22; border:1px solid #30363d;
+                border-radius:8px; padding:14px;">
+      <div style="font-size:0.62rem; color:#8b949e; text-transform:uppercase;
+                  letter-spacing:0.08em; font-weight:700;">Equity</div>
+      <div style="font-size:1.5rem; font-weight:700; color:#e6edf3;
+                  margin-top:4px;">${eq_v:,.2f}</div>
+    </div>
+    <div style="flex:1; background:#161b22; border:1px solid #30363d;
+                border-radius:8px; padding:14px;">
+      <div style="font-size:0.62rem; color:#8b949e; text-transform:uppercase;
+                  letter-spacing:0.08em; font-weight:700;">Balance</div>
+      <div style="font-size:1.5rem; font-weight:700; color:#e6edf3;
+                  margin-top:4px;">${bal_v:,.2f}</div>
+    </div>
+  </div>
+  <div style="display:flex; gap:10px;">
+    <div style="flex:1; background:#161b22; border:1px solid #30363d;
+                border-radius:8px; padding:14px;">
+      <div style="font-size:0.62rem; color:#8b949e; text-transform:uppercase;
+                  letter-spacing:0.08em; font-weight:700;">Session P&amp;L</div>
+      <div style="font-size:1.3rem; font-weight:700; color:{pnl_c};
+                  margin-top:4px;">{'+' if pnl_v>=0 else ''}{pnl_v:,.2f}</div>
+    </div>
+    <div style="flex:1; background:#161b22; border:1px solid #30363d;
+                border-radius:8px; padding:14px;">
+      <div style="font-size:0.62rem; color:#8b949e; text-transform:uppercase;
+                  letter-spacing:0.08em; font-weight:700;">Drawdown</div>
+      <div style="font-size:1.3rem; font-weight:700; color:{dd_c2};
+                  margin-top:4px;">{dd_a:.2f}%</div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
         st.markdown('<div class="sec-hdr">System State</div>',
                     unsafe_allow_html=True)
@@ -766,7 +815,7 @@ def _dashboard() -> None:
 
         if not LIVE_STATE_PATH.exists():
             st.warning("live_state.json not found — "
-                       "run `python main.py multi-live` to start the signal server.")
+                       "run `python start.py` to start the signal server.")
 
         st.markdown('<div class="sec-hdr">Log Tail — last 50 lines</div>',
                     unsafe_allow_html=True)

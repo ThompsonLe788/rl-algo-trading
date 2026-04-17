@@ -10,12 +10,13 @@
 2. [Cài Đặt Lần Đầu](#2-cài-đặt-lần-đầu)
 3. [Cấu Hình](#3-cấu-hình)
 4. [Khởi Động Hệ Thống](#4-khởi-động-hệ-thống)
-5. [Sử Dụng Dashboard](#5-sử-dụng-dashboard)
-6. [MT5: Gắn EA và Indicator](#6-mt5-gắn-ea-và-indicator)
+5. [Sử Dụng ATS_Panel trên MT5](#5-sử-dụng-ats_panel-trên-mt5)
+6. [Sử Dụng Dashboard Web](#6-sử-dụng-dashboard-web)
 7. [Thêm / Bớt Symbol](#7-thêm--bớt-symbol)
-8. [Dừng Hệ Thống](#8-dừng-hệ-thống)
-9. [Các Thao Tác Thường Gặp](#9-các-thao-tác-thường-gặp)
-10. [Câu Hỏi Thường Gặp (FAQ)](#10-câu-hỏi-thường-gặp)
+8. [Auto-Retrain (Tự Học)](#8-auto-retrain-tự-học)
+9. [Dừng Hệ Thống](#9-dừng-hệ-thống)
+10. [Các Thao Tác Thường Gặp](#10-các-thao-tác-thường-gặp)
+11. [Câu Hỏi Thường Gặp (FAQ)](#11-câu-hỏi-thường-gặp)
 
 ---
 
@@ -27,7 +28,7 @@
 | CPU | 4 core | 8+ core (training nhanh hơn) |
 | RAM | 8 GB | 16 GB (chạy nhiều symbol) |
 | Disk | 10 GB trống | SSD 50 GB+ |
-| Network | Kết nối ổn định (< 100ms latency đến broker) | Dây cáp, không WiFi |
+| Network | Kết nối ổn định (< 100ms đến broker) | Dây cáp, không WiFi |
 
 ### Phần Mềm
 - **Windows 10/11** (64-bit) — MT5 chỉ hỗ trợ Windows chính thức
@@ -46,7 +47,6 @@
 ### Bước 1: Tải Source Code
 
 ```bash
-# Từ terminal (Command Prompt hoặc PowerShell)
 git clone https://github.com/your-repo/xau-ats.git d:\xau_ats
 cd d:\xau_ats
 ```
@@ -56,7 +56,7 @@ Hoặc giải nén file ZIP vào `d:\xau_ats`.
 ### Bước 2: Tạo Virtual Environment
 
 ```bash
-# Trong d:\xau_ats
+cd d:\xau_ats
 python -m venv venv
 venv\Scripts\activate
 ```
@@ -69,7 +69,7 @@ Sau khi activate, bạn thấy `(venv)` ở đầu dòng lệnh.
 pip install -r requirements.txt
 ```
 
-Quá trình này mất 5-15 phút tùy tốc độ internet. Các thư viện chính:
+Quá trình này mất 5–15 phút. Các thư viện chính:
 - `MetaTrader5` — kết nối MT5
 - `stable-baselines3` — PPO/SAC agent
 - `torch` — PyTorch (T-KAN, neural networks)
@@ -79,19 +79,27 @@ Quá trình này mất 5-15 phút tùy tốc độ internet. Các thư viện ch
 
 ### Bước 4: Cài ZeroMQ cho MT5
 
-Tải `Experts/Libraries/libzmq.dll` cho MT5:
 1. Tải từ: [github.com/dingmaotu/mql-zmq/releases](https://github.com/dingmaotu/mql-zmq/releases)
-2. Copy `libzmq.dll` vào `%AppData%\MetaQuotes\Terminal\<ID>\MQL5\Libraries\`
+2. Copy `libzmq.dll` vào:
+   ```
+   %AppData%\MetaQuotes\Terminal\<ID>\MQL5\Libraries\
+   ```
 
 ### Bước 5: Copy File MQL5 vào MT5
 
-```
-Nguồn:       d:\xau_ats\mt5_bridge\ATS_Panel.mq5
-             d:\xau_ats\mt5_bridge\ATS_StrategyView.mq5
+Hệ thống gồm **2 file MQL5** với vai trò khác nhau:
 
-Đích (chọn một trong hai):
-  Option A:  %AppData%\MetaQuotes\Terminal\<ID>\MQL5\Experts\
-  Option B:  Dùng MT5 menu: File → Open Data Folder → MQL5\Experts\
+| File | Loại | Thư mục đích | Vai trò |
+|---|---|---|---|
+| `ATS_Panel.mq5` | **Indicator** | `MQL5\Indicators\` | Hiển thị trạng thái + giao tiếp Python |
+| `XauDayTrader.mq5` | **Expert Advisor** | `MQL5\Experts\` | Nhận tín hiệu ZMQ, đặt lệnh thật |
+
+```
+Nguồn:  d:\xau_ats\mt5_bridge\ATS_Panel.mq5
+Đích:   %AppData%\MetaQuotes\Terminal\<ID>\MQL5\Indicators\
+
+Nguồn:  d:\xau_ats\mt5_bridge\XauDayTrader.mq5
+Đích:   %AppData%\MetaQuotes\Terminal\<ID>\MQL5\Experts\
 ```
 
 Sau khi copy, trong MT5: **F5** để compile, hoặc double-click file trong Navigator.
@@ -99,7 +107,6 @@ Sau khi copy, trong MT5: **F5** để compile, hoặc double-click file trong Na
 ### Bước 6: Kiểm Tra Cài Đặt
 
 ```bash
-# Trong d:\xau_ats với venv đang activate
 python -c "import MetaTrader5; import zmq; import stable_baselines3; print('OK')"
 ```
 
@@ -111,58 +118,35 @@ Nếu in ra `OK` → cài đặt thành công.
 
 ### 3.1 File Cấu Hình Chính: `config.py`
 
-Mở `d:\xau_ats\config.py` và điều chỉnh các tham số theo nhu cầu:
-
 ```python
-# === Đường dẫn MT5 ===
-# Tự động phát hiện, hoặc set thủ công nếu MT5 cài ở vị trí khác:
-# MT5_FILES_PATH = Path(r"C:\Custom\MT5\Common\Files")
-
 # === Risk Management ===
-MAX_DRAWDOWN_PCT  = 15.0  # Kill switch khi drawdown > 15%
-MAX_RISK_PER_TRADE = 0.02  # Rủi ro tối đa mỗi lệnh = 2% tài khoản
-KELLY_FRACTION    = 0.1   # Dùng 10% Kelly (bảo thủ)
-EOD_HOUR_GMT      = 22    # Đóng tất cả lệnh lúc 22h GMT
+MAX_DRAWDOWN_PCT   = 15.0   # Kill switch khi drawdown > 15%
+MAX_RISK_PER_TRADE = 0.02   # Rủi ro tối đa mỗi lệnh = 2% tài khoản
+KELLY_FRACTION     = 0.1    # Dùng 10% Kelly (bảo thủ)
+EOD_HOUR_GMT       = 22     # Đóng tất cả lệnh lúc 22h GMT
 
 # === Kết Nối ===
-ZMQ_SIGNAL_ADDR   = "tcp://127.0.0.1:5555"
+ZMQ_SIGNAL_ADDR    = "tcp://127.0.0.1:5555"
 
 # === Training ===
-AUTO_TRAIN_BARS   = 50_000    # Số bar M1 để train
-AUTO_TRAIN_TIMESTEPS = 200_000  # Bước training PPO
+AUTO_TRAIN_BARS      = 50_000    # Số bar M1 để train lần đầu
+AUTO_TRAIN_TIMESTEPS = 200_000   # Bước training PPO lần đầu
+RETRAIN_TIMESTEPS    = 300_000   # Bước training PPO khi retrain
 ```
 
-**Lưu ý:** Không cần sửa gì khác nếu bạn dùng cài đặt mặc định.
+**Lưu ý:** Không cần sửa gì khác nếu dùng cài đặt mặc định.
 
 ### 3.2 Telegram Alerts (Tùy Chọn)
 
-Để nhận cảnh báo qua Telegram:
+1. Tạo bot: nhắn `/newbot` cho [@BotFather](https://t.me/botfather) → lấy TOKEN
+2. Copy `.env.example` thành `.env` và điền:
 
-1. Tạo bot: nhắn tin `/newbot` cho [@BotFather](https://t.me/botfather) → lấy `TOKEN`
-2. Get chat ID: nhắn `/start` cho bot, truy cập `https://api.telegram.org/bot<TOKEN>/getUpdates`
-3. Copy file `.env.example` thành `.env` và điền token:
-
-```bash
-copy .env.example .env
 ```
-
-Nội dung `.env`:
-```
-TELEGRAM_TOKEN=123456789:ABCdefGHI-your-actual-token-here
+TELEGRAM_TOKEN=123456789:ABCdef-your-token
 TELEGRAM_CHAT_ID=123456789
 ```
 
-**Quan trọng:** Không bao giờ điền token thẳng vào `config.py` — file `.env` được `.gitignore` bảo vệ, không bị commit lên GitHub.
-
-### 3.3 Biến Môi Trường (Tuỳ Chọn)
-
-File `.env` hỗ trợ tất cả biến môi trường:
-
-```
-TELEGRAM_TOKEN=your-token
-TELEGRAM_CHAT_ID=your-chat-id
-MT5_FILES_PATH=C:\Users\YourName\AppData\Roaming\MetaQuotes\Terminal\Common\Files
-```
+**Quan trọng:** Không điền token vào `config.py` — file `.env` được `.gitignore` bảo vệ.
 
 ---
 
@@ -171,19 +155,19 @@ MT5_FILES_PATH=C:\Users\YourName\AppData\Roaming\MetaQuotes\Terminal\Common\File
 ### Thứ Tự Khởi Động (Quan Trọng!)
 
 ```
-1. Mở MT5 terminal và đăng nhập tài khoản
+1. Mở MT5 → đăng nhập tài khoản
 2. Khởi động Python backend (multi-runner)
 3. Khởi động Streamlit dashboard
-4. Gắn ATS_Panel EA vào chart trong MT5
+4. Trong MT5: gắn XauDayTrader EA + ATS_Panel Indicator vào chart
 ```
 
 ### Bước 1: Mở MT5
 
-Đăng nhập tài khoản (demo hoặc live). Đảm bảo có kết nối phía dưới cùng MT5.
+Đăng nhập tài khoản. Đảm bảo có chữ "Connected" ở góc phải dưới MT5.
 
 ### Bước 2: Khởi Động Backend
 
-Mở **Terminal 1** (Command Prompt):
+Mở **Terminal 1**:
 
 ```bash
 cd d:\xau_ats
@@ -197,14 +181,14 @@ INFO [multi_runner] Multi-runner started. Scanning ... every 5s
 INFO [multi_runner] No active charts detected yet — waiting...
 ```
 
-Để chạy mãi ngay cả khi terminal đóng, dùng PowerShell và `Start-Process`:
+Để chạy ẩn nền (PowerShell):
 ```powershell
 Start-Process -WindowStyle Hidden python -ArgumentList "main.py multi-live"
 ```
 
 ### Bước 3: Khởi Động Dashboard
 
-Mở **Terminal 2** (Command Prompt mới):
+Mở **Terminal 2**:
 
 ```bash
 cd d:\xau_ats
@@ -212,117 +196,167 @@ venv\Scripts\activate
 streamlit run dashboard/app.py
 ```
 
-Mở trình duyệt → truy cập `http://localhost:8501`
+Truy cập `http://localhost:8501` bằng trình duyệt.
 
-### Bước 4: Gắn EA Vào Chart
+### Bước 4: Gắn Vào Chart MT5
 
-1. Trong MT5, mở chart: `File → New Chart → XAUUSD` (hoặc bất kỳ symbol nào)
-2. Chuyển timeframe sang **M1** (khuyến nghị, nhưng không bắt buộc — EA hoạt động ở mọi TF)
-3. Trong **Navigator** → **Expert Advisors** → kéo `ATS_Panel` vào chart
-4. Trong cửa sổ cài đặt:
-   - **Allow algo trading**: ✅ tick
-   - **Allow DLL imports**: ✅ tick (cần cho ZMQ)
-5. Click OK — EA sẽ hiện lên góc trên phải chart
+Trong MT5, với mỗi chart symbol muốn giao dịch:
 
-Sau vài giây, trong Terminal 1 bạn sẽ thấy:
+1. Mở chart: `File → New Chart → XAUUSD`
+2. **Gắn EA** (đặt lệnh): Navigator → **Expert Advisors** → kéo `XauDayTrader` vào chart
+   - **Allow algo trading**: ✅
+   - **Allow DLL imports**: ✅ (cần cho ZMQ)
+3. **Gắn Indicator** (hiển thị): Navigator → **Indicators** → kéo `ATS_Panel` vào chart
+   - Panel hiện ra ở **góc trên trái** của chart
+
+Sau vài giây, Terminal 1 sẽ hiện:
 ```
 INFO [multi_runner] New chart detected: XAUUSD — starting worker
-INFO [XAUUSD] status → waiting
-INFO [XAUUSD] Fetching 50000 bars from MT5...
-INFO [XAUUSD] Training PPO on 50000 bars, 200000 timesteps...
+INFO [XAUUSD] Model loaded
+INFO [XAUUSD] status → live
 ```
 
-**Lần đầu training mất 3-5 phút.** Các lần tiếp theo tải model đã train ngay lập tức.
+**Lần đầu tiên (chưa có model):**
+```
+INFO [XAUUSD] No model found — starting auto-train
+INFO [XAUUSD] Training PPO on 50000 bars, 200000 timesteps...
+```
+→ Chờ **3–5 phút**. Sau đó tự động chuyển sang "live".
 
 ---
 
-## 5. Sử Dụng Dashboard
+## 5. Sử Dụng ATS_Panel trên MT5
 
-Truy cập `http://localhost:8501` để xem dashboard.
+ATS_Panel là indicator hiển thị trạng thái toàn bộ hệ thống ngay trên chart, **góc trên trái**.
 
-### 5.1 Sidebar
+### Các Section
+
+```
+┌─────────────────────────────────┐
+│ ATS PANEL — XAUUSD              │
+├─────────────────────────────────┤
+│ MARKET                          │
+│  Chart TF: M1  │ ATS TF: M1(RL) │
+│  Session: London│ Spread: 0.8bp  │
+├─────────────────────────────────┤
+│ POSITION                        │
+│  Status: LONG  │ Regime: RANGE  │
+│  Entry: 3200.50                 │
+│  Unrealized: +12.30             │
+│  Sym DD: 0.5%  │ Acct DD: 0.5%  │
+├─────────────────────────────────┤
+│ SIGNALS (last 5)                │
+│  Dir │ Price  │Win%│R/R│Lot│Time│
+│  BUY │3200.50 │57% │1.8│0.1│08:32│
+│  ...                            │
+│  SL: 3192.00  TP: 3215.00       │
+│  Z-Score: -1.82                 │
+├─────────────────────────────────┤
+│ RISK                            │
+│  Kelly f: 1.67%                 │
+│  Equity: 10,120 │Balance: 10,000│
+├─────────────────────────────────┤
+│ AI MODEL                        │
+│  Version: ppo_xauusd [04-15 23:32]│
+│  Status: Running                │
+│  Last Train: ---                │
+│  Reason: ---                    │
+│  WinRate: 55.0%│ Sharpe: 1.23   │
+│  Trades: 34                     │
+├─────────────────────────────────┤
+│ SYSTEM                          │
+│  Kill: ---                      │
+│  Heartbeat: 3s ago              │
+│  Updated: 10:38:02              │
+└─────────────────────────────────┘
+```
+
+### Ý Nghĩa Các Section
+
+**MARKET** — thông tin thị trường hiện tại
+| Field | Ý nghĩa |
+|---|---|
+| Chart TF | Timeframe của chart đang xem |
+| ATS TF | Timeframe AI phân tích (M1 RL = M1 bar với PPO) |
+| Session | Phiên giao dịch hiện tại (Tokyo / London / NY / Off) |
+| Spread | Spread hiện tại (basis points) |
+
+**POSITION** — vị thế đang mở
+| Field | Ý nghĩa |
+|---|---|
+| Status | LONG / SHORT / FLAT |
+| Regime | RANGE (đi ngang) / TREND (có xu hướng) |
+| Entry | Giá vào lệnh |
+| Unrealized | Lãi/lỗ chưa chốt (USD) |
+| Sym DD | Drawdown tính theo symbol này |
+| Acct DD | Drawdown tài khoản tổng |
+
+**SIGNALS** — 5 tín hiệu gần nhất
+| Cột | Ý nghĩa |
+|---|---|
+| Dir | BUY / SELL / CLOSE |
+| Price | Giá lúc phát tín hiệu |
+| Win% | Xác suất thắng theo AI |
+| R/R | Tỷ lệ risk/reward |
+| Lot | Kích thước lệnh |
+| Time | Giờ phát tín hiệu (GMT) |
+
+**AI MODEL** — thông tin model đang dùng
+| Field | Ý nghĩa |
+|---|---|
+| Version | Tên model + ngày train |
+| Status | Running / **TRAINING** (đang retrain) |
+| Last Train | Thời điểm retrain gần nhất |
+| Reason | Lý do retrain (weekly / drift) |
+| WinRate | Tỷ lệ thắng rolling 50 lệnh |
+| Sharpe | Chỉ số Sharpe rolling |
+| Trades | Tổng số lệnh đã thực hiện |
+
+**SYSTEM** — trạng thái hệ thống
+| Field | Ý nghĩa |
+|---|---|
+| Kill | Lý do kill switch (nếu kích hoạt) |
+| Heartbeat | Thời gian từ nhịp tim cuối (< 15s = bình thường) |
+| Updated | Thời gian JSON cập nhật lần cuối |
+
+### Màu Sắc Trạng Thái
+
+| Màu | Ý nghĩa |
+|---|---|
+| Xanh lá | Hoạt động bình thường / LONG |
+| Đỏ | Cảnh báo / SHORT / lỗi |
+| Vàng | Đang xử lý / đang train |
+| Trắng | Neutral / FLAT |
+
+---
+
+## 6. Sử Dụng Dashboard Web
+
+Truy cập `http://localhost:8501`.
+
+### Sidebar
 
 | Phần | Mô tả |
 |---|---|
-| **Status badge** | 🟢 LIVE (đang chạy) / 🔴 KILLED (kill switch kích hoạt) / ⚪ OFFLINE (không có dữ liệu) |
-| **Equity** | Số dư tài khoản hiện tại |
-| **Balance** | Số dư gốc |
+| **Status badge** | 🟢 LIVE / 🔴 KILLED / ⚪ OFFLINE |
+| **Equity / Balance** | Số dư tài khoản |
 | **Session P&L** | Lãi/lỗ phiên hiện tại |
-| **Drawdown gauge** | Gauge màu: xanh (< 5%), cam (5-10%), đỏ (> 10%) |
-| **Heartbeat** | Thời gian kể từ tín hiệu cuối. Nếu > 30s → cần kiểm tra |
+| **Drawdown gauge** | Xanh (< 5%), cam (5–10%), đỏ (> 10%) |
+| **Heartbeat** | Nếu > 30s → kiểm tra backend |
 
-### 5.2 Tabs Theo Symbol
-
-Mỗi symbol đang active hiển thị một tab:
+### Tabs Theo Symbol
 
 | Field | Ý nghĩa |
 |---|---|
 | **Worker status** | ⏳ training / 🟢 live / ⚪ waiting / 🔴 error |
-| **Regime** | RANGE (đi ngang) hoặc TREND (có xu hướng) |
-| **Position** | Vị thế hiện tại: LONG / SHORT / FLAT |
-| **Entry price** | Giá vào lệnh |
-| **Unrealized P&L** | Lãi/lỗ chưa chốt |
-| **Kelly f*** | Tỷ lệ vốn Kelly hiện tại |
-| **Equity curve** | Biểu đồ equity trong phiên |
-| **Log** | 100 dòng log gần nhất liên quan symbol |
+| **Regime** | RANGE / TREND |
+| **Position** | LONG / SHORT / FLAT |
+| **Model version** | Tên + ngày train |
+| **Win rate / Sharpe** | Hiệu suất rolling |
+| **Equity curve** | Biểu đồ trong phiên |
+| **Log** | 100 dòng log gần nhất |
 
-### 5.3 Tab System
-
-Hiển thị:
-- Trạng thái kill switch
-- Tổng số tín hiệu đã gửi
-- Lý do kill (nếu có)
-- Worker status của tất cả symbols
-
-### 5.4 Auto-Refresh
-
-Dashboard tự refresh mỗi **5 giây**. Không cần F5 thủ công.
-
----
-
-## 6. MT5: Gắn EA và Indicator
-
-### 6.1 ATS_Panel (EA — Đặt Lệnh)
-
-EA này nhận tín hiệu từ Python và đặt lệnh thật sự.
-
-**Các tham số quan trọng khi gắn:**
-
-| Tham số | Mặc định | Mô tả |
-|---|---|---|
-| `ZmqAddr` | `tcp://127.0.0.1:5555` | Địa chỉ ZMQ kết nối Python |
-| `Symbol` | Tự động | Symbol của chart (không cần đổi) |
-| `MagicNumber` | `20240101` | ID để phân biệt lệnh ATS với lệnh thủ công |
-| `MaxSlippage` | `10` | Slippage tối đa chấp nhận (points) |
-| `FileSignalFallback` | `true` | Dùng file JSON nếu ZMQ ngắt |
-
-**Kiểm tra EA hoạt động:** Góc phải trên chart có icon mặt cười 😊 (allow trading) không có dấu X màu đỏ.
-
-### 6.2 ATS_StrategyView (Indicator — Chỉ Nhìn)
-
-Indicator này hiển thị chiến lược lên biểu đồ (không đặt lệnh). Thêm vào cùng chart với EA.
-
-```
-Navigator → Indicators → ATS_StrategyView → kéo vào chart
-```
-
-**Cái bạn sẽ thấy:**
-- **Đường xanh (VWAP)**: Giá trung bình có trọng số volume trong ngày
-- **Đường cam chấm (ATR bands)**: Vùng ±1.5×ATR từ VWAP
-- **Mũi tên xanh lá (↑)**: Tín hiệu Long từ AI
-- **Mũi tên đỏ (↓)**: Tín hiệu Short từ AI
-- **Vòng tròn vàng (○)**: Đóng vị thế
-- **Subwindow dưới**: Z-score (magenta) — dưới -2 → oversold, trên +2 → overbought
-- **Màu nền**: Xám = RANGE regime, xanh nhạt = TREND regime
-
-**Tham số ATS_StrategyView:**
-
-| Tham số | Mặc định | Mô tả |
-|---|---|---|
-| `ZScoreWindow` | 50 | Cửa sổ tính z-score (bars) |
-| `ATRPeriod` | 14 | Chu kỳ ATR |
-| `ATRMultSL` | 1.5 | Nhân số ATR cho bands |
-| `RefreshSec` | 2 | Tần suất đọc file tín hiệu (giây) |
+Dashboard tự refresh mỗi **5 giây**.
 
 ---
 
@@ -331,118 +365,162 @@ Navigator → Indicators → ATS_StrategyView → kéo vào chart
 ### Thêm Symbol Mới
 
 1. Trong MT5 → mở chart symbol mới (ví dụ: EURUSD)
-2. Gắn `ATS_Panel` EA vào chart đó (như bước 4 ở trên)
+2. Gắn `XauDayTrader` EA + `ATS_Panel` Indicator vào chart đó
 3. Python multi-runner tự động phát hiện trong ≤ 5 giây
-4. Worker mới khởi động → tự train model cho EURUSD nếu chưa có
+4. Worker mới khởi động → tự train nếu chưa có model
 
-**Không cần restart bất kỳ thứ gì!** Multi-runner scan tự động.
+**Không cần restart bất kỳ thứ gì.** Multi-runner scan tự động.
 
 ### Bớt / Tạm Dừng Symbol
 
-Chỉ cần **xóa EA** khỏi chart hoặc **đóng chart**:
-- EA OnDeinit ghi `ats_chart_EURUSD.txt = "0"`
+Chỉ cần **xóa ATS_Panel** khỏi chart hoặc **đóng chart**:
+- ATS_Panel ghi `ats_chart_EURUSD.txt = "0"` khi bị gỡ
 - Multi-runner phát hiện trong ≤ 5 giây → dừng worker EURUSD
-- Model đã train vẫn còn lưu, lần sau gắn lại sẽ load ngay
+- Model đã train vẫn lưu, lần sau gắn lại sẽ load ngay
 
 ### Symbols Được Hỗ Trợ
 
-Về lý thuyết, bất kỳ symbol nào MT5 hỗ trợ đều hoạt động. Đã test thực tế:
-- ✅ XAUUSD (tốt nhất, đây là mục tiêu chính)
-- ✅ EURUSD
-- ✅ BTCUSD / BTCUSDT
+| Symbol | Tình trạng | Ghi chú |
+|---|---|---|
+| XAUUSD | ✅ Ưu tiên | Mục tiêu chính, cấu hình tối ưu |
+| EURUSD | ✅ Đã test | spread 0.3bp, leverage 500 |
+| GBPUSD | ✅ Đã test | spread 0.4bp, leverage 500 |
+| USDJPY | ✅ Đã test | spread 0.3bp, 3 decimals |
+| BTCUSD | ✅ Đã test | spread cao hơn, leverage 100 |
+| NAS100 | ✅ Đã test | EOD 21h GMT |
+| Khác | ⚠️ Chưa test | Cần cấu hình trong `config.py` |
 
 **Lưu ý:** Model train riêng cho từng symbol. XAUUSD model không dùng được cho EURUSD.
 
 ---
 
-## 8. Dừng Hệ Thống
+## 8. Auto-Retrain (Tự Học)
+
+Hệ thống **tự động retrain** mà không cần can thiệp thủ công.
+
+### Khi Nào Tự Retrain?
+
+| Điều kiện | Chi tiết |
+|---|---|
+| **Weekly schedule** | Mỗi thứ Hai, một lần/tuần tự động |
+| **Drift detection** | Win rate < 43% trong chuỗi lệnh gần nhất |
+
+### Quá Trình Retrain (Tự Động)
+
+```
+1. [Phát hiện trigger] → AutoRetrainer khởi động training ngầm
+2. [Panel hiển thị]    → AI MODEL → Status: "TRAINING"
+3. [Training xong]     → Đánh giá model mới vs model cũ (Sharpe)
+4. [Nếu model mới tốt hơn] → Tự động swap, model cũ backup
+5. [Nếu model mới kém hơn] → Giữ nguyên model cũ
+6. [Panel cập nhật]    → Version mới, Last Train, Reason
+```
+
+Trong lúc retrain, **live trading tiếp tục bình thường** với model hiện tại.
+
+### Theo Dõi Quá Trình Retrain
+
+**Trên ATS_Panel (MT5):**
+- `Status: TRAINING` → đang train
+- `Status: Running` → đã xong
+
+**Trên Dashboard:**
+- Worker status: `retraining`
+
+**Trong log:**
+```bash
+Get-Content d:\xau_ats\logs\signal_server.log -Tail 30 | Select-String "AutoRetrain"
+```
+
+### Retrain Thủ Công
+
+Nếu muốn retrain ngay (không chờ lịch tự động):
+
+```bash
+# Dừng worker: xóa ATS_Panel khỏi chart trong MT5
+
+# Train lại với dữ liệu mới nhất
+python main.py train --symbol XAUUSD --bars 50000
+
+# Gắn lại ATS_Panel vào chart → worker load model mới
+```
+
+---
+
+## 9. Dừng Hệ Thống
 
 ### Dừng Đúng Cách
 
-**Bước 1:** Trong MT5 → xóa tất cả EA khỏi các chart (chuột phải → Remove Expert)
+**Bước 1:** Trong MT5 → xóa ATS_Panel khỏi các chart (chuột phải → Remove Indicator)
 
-**Bước 2:** Trong Terminal 1 (multi-runner) → nhấn `Ctrl+C`:
+**Bước 2:** Terminal 1 → `Ctrl+C`:
 ```
 INFO [multi_runner] Shutting down multi-runner...
 INFO [multi_runner] All workers stopped.
 ```
 
-**Bước 3:** Trong Terminal 2 (streamlit) → nhấn `Ctrl+C`
+**Bước 3:** Terminal 2 (Streamlit) → `Ctrl+C`
 
 ### Dừng Khẩn Cấp
 
-Nếu không thể dừng bình thường:
-
 ```bash
-# Tìm và kill process Python
 taskkill /f /im python.exe
-
-# Hoặc mở Task Manager → tìm python.exe → End Task
 ```
 
-**Quan trọng:** Sau khi kill Python, mọi lệnh đang mở trong MT5 vẫn còn (MT5 quản lý độc lập). Kiểm tra và đóng thủ công nếu cần.
+**Quan trọng:** Sau khi kill Python, lệnh đang mở trong MT5 vẫn còn. Kiểm tra và đóng thủ công nếu cần.
 
 ### Kill Switch Tự Động
 
-Hệ thống tự động dừng giao dịch khi:
-- Drawdown > 15% → `status = "killed"`, dashboard hiện 🔴
-- Telegram nhận cảnh báo: "⚠️ Kill switch activated"
+Hệ thống tự dừng giao dịch khi:
+- Drawdown > **15%** → `status = "killed"`, dashboard 🔴
+- Telegram: "⚠️ Kill switch activated"
 
-Để reset sau kill switch:
+Reset sau kill switch:
 ```bash
 python main.py reset-kill
 ```
-Hoặc khởi động lại toàn bộ hệ thống.
 
 ---
 
-## 9. Các Thao Tác Thường Gặp
+## 10. Các Thao Tác Thường Gặp
 
-### Train Lại Model
-
-Khi muốn train lại model với dữ liệu mới nhất:
+### Kiểm Tra Trạng Thái Nhanh
 
 ```bash
-# Train lại XAUUSD
-python main.py train --symbol XAUUSD --bars 50000
+# Worker status
+type d:\xau_ats\logs\worker_status.json
 
-# Train lại với dữ liệu tổng hợp (không cần MT5)
-python main.py train --symbol XAUUSD --bars 50000 --synthetic
+# Live state (equity, positions, model info)
+python -c "
+import json
+from pathlib import Path
+d = json.loads(Path('logs/live_state.json').read_text())
+for sym in ['XAUUSD','EURUSD']:
+    s = d.get(sym, {})
+    print(f'{sym}: pos={s.get(\"position\")} model={s.get(\"model_version\",\"?\")} wr={s.get(\"win_rate\",0):.0%}')
+"
 ```
 
-### Xem Log
+### Xem Log Real-Time
 
-```bash
-# Log giao dịch real-time
-type d:\xau_ats\logs\signal_server.log
-
+```powershell
 # Theo dõi liên tục (PowerShell)
 Get-Content d:\xau_ats\logs\signal_server.log -Wait -Tail 50
+
+# Chỉ xem lỗi
+Select-String -Path d:\xau_ats\logs\signal_server.log -Pattern "ERROR|CRITICAL"
+
+# Xem tín hiệu giao dịch
+Select-String -Path d:\xau_ats\logs\signal_server.log -Pattern "Published"
 ```
 
 ### Chạy Backtest
 
 ```bash
-# Walk-forward backtest trên XAUUSD, 3 tháng
 python main.py backtest --symbol XAUUSD --months 3
 ```
 
-Kết quả xuất ra màn hình gồm: Sharpe ratio, max drawdown, win rate, profit factor theo từng fold.
-
-### Kiểm Tra Trạng Thái Workers
-
-```bash
-type d:\xau_ats\logs\worker_status.json
-```
-
-Output ví dụ:
-```json
-{
-  "XAUUSD": "live",
-  "EURUSD": "training",
-  "BTCUSD": "waiting"
-}
-```
+Kết quả: Sharpe ratio, max drawdown, win rate, profit factor theo từng fold.
 
 ### Xem Model Đã Có
 
@@ -450,10 +528,11 @@ Output ví dụ:
 dir d:\xau_ats\ai_models\checkpoints\
 ```
 
-Output ví dụ:
+Output mẫu:
 ```
-ppo_xauusd.zip   (45 MB)
-ppo_eurusd.zip   (44 MB)
+ppo_xauusd.zip          (45 MB) — 2026-04-15 23:32
+ppo_eurusd.zip          (44 MB) — 2026-04-13 08:03
+ppo_xauusd_backup_20260413_0830.zip  — bản backup trước retrain
 ```
 
 ### Chạy Test Suite
@@ -462,76 +541,88 @@ ppo_eurusd.zip   (44 MB)
 python -m pytest tests/ -v
 ```
 
-Tất cả 38 tests phải pass. Nếu có test fail sau khi chỉnh code → không deploy.
+Tất cả tests phải pass. Nếu fail sau khi chỉnh code → không deploy.
 
 ---
 
-## 10. Câu Hỏi Thường Gặp
+## 11. Câu Hỏi Thường Gặp
 
-### "Worker gặp lỗi" trên dashboard
+### Panel ATS_Panel không hiện trên chart?
 
-**Bước 1:** Xem log để tìm nguyên nhân:
+1. Đảm bảo copy file vào **`MQL5\Indicators\`** (không phải `MQL5\Experts\`)
+2. Trong MT5: F5 để compile lại
+3. Navigator → Indicators → tìm `ATS_Panel` → kéo vào chart
+4. Kiểm tra không có lỗi trong MT5 → View → Terminal → Experts tab
+
+### Section AI MODEL hoặc SIGNALS trống?
+
+Python backend chưa ghi dữ liệu. Kiểm tra:
+```bash
+# Backend có chạy không?
+tasklist | findstr python
+
+# Worker status
+type d:\xau_ats\logs\worker_status.json
+```
+Nếu không có Python process → `python main.py multi-live`
+
+Nếu đang chạy nhưng vẫn trống → chờ 15 giây (1 heartbeat cycle).
+
+### "Worker gặp lỗi" trên dashboard?
+
 ```bash
 type d:\xau_ats\logs\signal_server.log | findstr "ERROR"
 ```
 
-**Nguyên nhân thường gặp:**
 | Lỗi | Nguyên nhân | Giải pháp |
 |---|---|---|
 | `MT5 init failed` | MT5 chưa mở hoặc chưa đăng nhập | Mở MT5, đăng nhập |
-| `Address in use` | Port 5555 đang bị chiếm | Tắt process Python cũ, restart |
-| `No bars returned` | MT5 không có dữ liệu symbol này | Kiểm tra symbol in MT5, tải history |
-| `Auto-train failed` | Thiếu thư viện hoặc RAM | Pip install lại, kiểm tra RAM |
+| `Address in use` | Port 5555 bị chiếm | Tắt Python cũ, restart |
+| `No bars returned` | MT5 không có dữ liệu symbol | Kiểm tra symbol, tải history |
+| `Auto-train failed` | Thiếu thư viện hoặc RAM | Pip install lại |
 
-### "Heartbeat > 30s" trên dashboard
+### "Heartbeat > 30s" trên dashboard?
 
-Python backend không gửi được tín hiệu. Kiểm tra:
-1. Terminal 1 (multi-runner) còn đang chạy không?
-2. Có lỗi gì trong log không?
+Backend không cập nhật. Kiểm tra:
+1. Terminal 1 (multi-runner) còn chạy không?
+2. Có lỗi trong log không?
 3. Restart multi-runner nếu cần
 
-### MT5 không nhận được tín hiệu
+### MT5 không nhận được tín hiệu / không đặt lệnh?
 
-1. Kiểm tra EA có icon 😊 không (phải là mặt cười, không phải ☹️)
+1. Kiểm tra `XauDayTrader` EA có icon 😊 không (phải là mặt cười, không ☹️)
 2. MT5 → Tools → Options → Expert Advisors → tick "Allow automated trading"
-3. Kiểm tra `libzmq.dll` đã copy vào đúng thư mục MQL5\Libraries\ chưa
+3. Kiểm tra `libzmq.dll` đã copy vào `MQL5\Libraries\` chưa
+4. Kiểm tra MT5 Journal tab xem có lỗi gì không
 
-### Lệnh không được đặt dù có tín hiệu
+### AI đang train — có giao dịch không?
 
-1. Trong MT5, kiểm tra tab **Journal** — xem có lỗi gì không
-2. Kiểm tra broker cho phép auto trading (một số broker yêu cầu xác minh)
-3. Kiểm tra tài khoản có đủ margin không
+Có. Trong lúc auto-retrain:
+- Model cũ vẫn chạy giao dịch bình thường
+- Panel hiển thị `Status: TRAINING`
+- Khi xong, nếu model mới tốt hơn → tự swap không gián đoạn
 
-### Cách biết AI đang ra quyết định gì?
+### Bao lâu auto-retrain một lần?
 
-Dashboard → tab symbol → xem **Position** và **Last Signal** (nếu có). Hoặc xem chart với `ATS_StrategyView` để thấy mũi tên tín hiệu và z-score.
+- **Hàng tuần (thứ Hai):** Luôn luôn, tự động
+- **Drift detection:** Ngay khi win rate < 43% trong chuỗi lệnh gần đây (minimum 30 lệnh)
+- Giữa hai lần drift retrain có cooldown **24 giờ** (tránh thrashing)
 
-### Model có thể đặt lệnh ngược chiều nhau không?
+### Mất điện hoặc crash giữa chừng?
 
-Không trong cùng một symbol. Mỗi symbol chỉ có một vị thế tại một thời điểm (Long, Short, hoặc Flat). Agent không mở thêm lệnh khi đã có vị thế — phải đóng (action=3 "Close") trước khi đảo chiều.
-
-### Bao lâu thì train lại model?
-
-Không có lịch cố định, nhưng khuyến nghị:
-- **Hàng tuần:** Kiểm tra win rate trong log. Nếu < 45% → cân nhắc retrain
-- **Mỗi tháng:** Retrain với 50.000 bar mới nhất
-- **Sau sự kiện lớn** (Fed meeting, financial crisis): Retrain ngay
+Lệnh đang mở trong MT5 vẫn còn (MT5 quản lý độc lập). Khi restart:
+1. Kiểm tra MT5: có lệnh nào còn mở không?
+2. Khởi động lại `python main.py multi-live`
+3. Gắn lại ATS_Panel Indicator + XauDayTrader EA vào charts
+4. Hệ thống sync lại trong < 30 giây
 
 ### Có thể chạy 24/7 không?
 
 Có, nhưng lưu ý:
-- Hệ thống tự đóng lệnh lúc **22h GMT** mỗi ngày
+- Tự đóng lệnh lúc **22h GMT** mỗi ngày
 - Không mở lệnh mới sau **21h GMT**
-- Cuối tuần (thứ 7-chủ nhật): Vàng đóng cửa, không có tick → worker ở trạng thái chờ
-- Nên restart hệ thống mỗi sáng thứ Hai để clear cache
-
-### Mất điện hoặc crash giữa chừng?
-
-Lệnh đang mở trong MT5 vẫn còn (MT5 quản lý độc lập với Python). Khi restart:
-1. Kiểm tra MT5: có lệnh nào còn mở không?
-2. Khởi động lại multi-runner
-3. Gắn lại EA vào charts
-4. Hệ thống tiếp tục bình thường — `live_state.json` sẽ sync lại trong < 30 giây
+- Cuối tuần: Vàng đóng cửa, worker ở trạng thái chờ
+- Khuyến nghị: restart hệ thống mỗi sáng thứ Hai
 
 ---
 
@@ -541,9 +632,10 @@ Lệnh đang mở trong MT5 vẫn còn (MT5 quản lý độc lập với Python
 |---|---|
 | `python main.py multi-live` | Khởi động backend đa symbol |
 | `streamlit run dashboard/app.py` | Khởi động dashboard |
-| `python main.py train --symbol XAUUSD` | Train model XAUUSD |
+| `python main.py train --symbol XAUUSD` | Train thủ công XAUUSD |
 | `python main.py backtest --symbol XAUUSD` | Chạy backtest |
 | `python -m pytest tests/ -v` | Chạy tất cả tests |
 | `python main.py reset-kill` | Reset kill switch |
 | `type logs\signal_server.log` | Xem log giao dịch |
 | `type logs\worker_status.json` | Xem trạng thái workers |
+| `type logs\live_state.json` | Xem trạng thái live đầy đủ |

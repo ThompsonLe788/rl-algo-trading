@@ -26,7 +26,7 @@ input int      NoNewTradesHour   = 21;                     // No new trades afte
 input double   AtrMultSL         = 1.5;                    // ATR multiplier for SL
 input double   MaxDrawdownPct    = 15.0;                   // Kill switch drawdown %
 input int      AtrPeriod         = 14;                     // ATR calculation period
-input int      MagicNumber       = 20250411;               // EA magic number
+input int      MagicNumberInput  = 0;                      // Magic number (0 = auto from symbol)
 input string   SignalFile        = "";                     // Fallback file (blank = {symbol}_signal.json)
 input int      ZmqRecvTimeoutMs  = 50;                     // ZMQ recv timeout (ms)
 input int      HeartbeatMaxSec   = 30;                     // Max seconds without HB
@@ -35,10 +35,27 @@ input int      HeartbeatMaxSec   = 30;                     // Max seconds withou
 input double   TrailAtrMult      = 1.0;                    // Trailing stop ATR multiplier
 input bool     EnableTrailingStop = true;                  // Enable dynamic trailing stop
 
+//--- Input parameters (partial TP)
+input bool     EnablePartialTP   = true;                   // Close 50% at TP1, trail rest
+input double   PartialTPAtrMult  = 1.5;                    // TP1 distance = this × ATR
+
+//--- Input parameters (on-chart panel)
+input bool     ShowPanel         = true;                   // Show EA status panel
+input int      PanelX            = 5;                      // Panel right margin (px)
+input int      PanelY            = 30;                     // Panel top margin (px)
+input color    PnlClrBg          = C'20,20,35';            // Panel background
+input color    PnlClrTitle       = clrGold;                // Panel title colour
+input color    PnlClrLabel       = clrSilver;              // Panel label colour
+input int      PnlFontSz         = 9;                      // Panel font size
+input string   PnlFontName       = "Consolas";             // Panel font name
+
+#define EA_PREFIX "XDT_"
+
 //--- Global variables
 CTrade trade;
 double g_peakEquity;
 int    g_atrHandle;
+int    MagicNumber;         // resolved in OnInit (auto or manual)
 string g_effectiveTopic;    // = ZmqTopic if set, else _Symbol
 string g_effectiveSigFile;  // = SignalFile if set, else {symbol_lower}_signal.json
 
@@ -51,6 +68,19 @@ struct TrailState
 };
 TrailState g_trails[100];
 int        g_trailCount = 0;
+
+//--- Partial TP state per position
+struct PartialTPState
+{
+   ulong  ticket;
+   double tp1Level;      // price at which 50% is closed
+   double entryPrice;    // original entry (used for breakeven SL move)
+   double origLot;       // full lot at entry
+   bool   partialDone;   // true once partial close executed
+   int    side;          // +1 long, -1 short
+};
+PartialTPState g_partialTPs[100];
+int            g_partialTPCount = 0;
 
 //--- ZeroMQ objects
 Context  g_zmqCtx;
@@ -74,11 +104,36 @@ struct SignalData
 };
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Generate a deterministic magic number from symbol name            |
+//| DJB2 hash seeded with 0xATS prefix → unique per symbol           |
+//+------------------------------------------------------------------+
+int _SymbolMagic(const string &sym)
+{
+   uint hash = 5381;  // DJB2 seed
+   for(int i = 0; i < StringLen(sym); i++)
+      hash = ((hash << 5) + hash) + StringGetCharacter(sym, i);
+   // Keep positive 31-bit, prefix with 20 for readability
+   return (int)(2000000000 + (hash % 100000000));
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
+   //--- Resolve magic number: 0 = auto from symbol
+   MagicNumber = (MagicNumberInput > 0) ? MagicNumberInput : _SymbolMagic(_Symbol);
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(10);
-   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   // SYMBOL_FILLING_MODE bitmask: 1=FOK, 2=IOC, 0=RETURN only
+   // For pending limit orders RETURN is correct (order stays until filled/cancelled).
+   // Only fall back to FOK when the broker truly forbids RETURN (bitmask == 1).
+   {
+      int fillBits = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+      if(fillBits == 1)   // broker supports FOK only
+         trade.SetTypeFilling(ORDER_FILLING_FOK);
+      else
+         trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   }
 
    //--- Resolve dynamic topic: use ZmqTopic input or fall back to _Symbol
    g_effectiveTopic   = (StringLen(ZmqTopic) > 0) ? ZmqTopic : _Symbol;
@@ -89,7 +144,9 @@ int OnInit()
                         : symLower + "_signal.json";
 
    g_peakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   g_atrHandle  = iATR(_Symbol, PERIOD_M5, AtrPeriod);
+   // Use PERIOD_M1 to match the ATR timeframe used in Python feature engineering.
+   // Training uses M1 ATR; using M5 here would create SL distance mismatch.
+   g_atrHandle  = iATR(_Symbol, PERIOD_M1, AtrPeriod);
 
    if(g_atrHandle == INVALID_HANDLE)
    {
@@ -123,6 +180,7 @@ int OnInit()
    Print("XauDayTrader v2 initialized. Symbol=", _Symbol,
          " Magic=", MagicNumber, " ZMQ=", (g_zmqConnected ? "ON" : "OFF"),
          " Topic=", g_effectiveTopic, " SigFile=", g_effectiveSigFile);
+   _DrawEAPanel();
    return INIT_SUCCEEDED;
 }
 
@@ -130,6 +188,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   _DeleteEAPanel();
    if(g_atrHandle != INVALID_HANDLE)
       IndicatorRelease(g_atrHandle);
 
@@ -148,6 +207,10 @@ void OnTick()
    //--- Poll ZMQ on every tick for lowest latency
    if(g_zmqConnected)
       DrainZmqMessages();
+
+   //--- Check partial TP levels before trailing stop
+   if(EnablePartialTP)
+      CheckPartialTP();
 
    //--- Update ATR trailing stop on every tick
    if(EnableTrailingStop)
@@ -261,6 +324,9 @@ void OnTimer()
       if(ReadSignalFromFile(sig))
          ExecuteSignal(sig);
    }
+
+   //--- 6. Refresh panel
+   _DrawEAPanel();
 }
 
 //+------------------------------------------------------------------+
@@ -363,27 +429,73 @@ void ExecuteSignal(const SignalData &sig)
       return;
 
    //--- Execute LIMIT ORDER only
-   sl = NormalizeDouble(sl, _Digits);
-   tp = NormalizeDouble(tp, _Digits);
+   sl    = NormalizeDouble(sl, _Digits);
+   tp    = NormalizeDouble(tp, _Digits);
    double price = NormalizeDouble(sig.price, _Digits);
 
+   //--- Validate price direction (BuyLimit must be below Ask, SellLimit above Bid)
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(sig.side > 0 && price >= ask)
+     {
+      // Signal price at or above market — shift to 1 tick below Ask
+      price = NormalizeDouble(ask - _Point, _Digits);
+      Print("BuyLimit price adjusted below Ask: ", price, " Ask=", ask);
+     }
+   else if(sig.side < 0 && price <= bid)
+     {
+      // Signal price at or below market — shift to 1 tick above Bid
+      price = NormalizeDouble(bid + _Point, _Digits);
+      Print("SellLimit price adjusted above Bid: ", price, " Bid=", bid);
+     }
+
+   //--- Validate SL on correct side
+   if(sig.side > 0  && sl >= price) sl = NormalizeDouble(price - AtrMultSL * atr[0], _Digits);
+   if(sig.side < 0  && sl <= price) sl = NormalizeDouble(price + AtrMultSL * atr[0], _Digits);
+   if(sig.side > 0  && tp <= price) tp = NormalizeDouble(price + 2.0 * AtrMultSL * atr[0], _Digits);
+   if(sig.side < 0  && tp >= price) tp = NormalizeDouble(price - 2.0 * AtrMultSL * atr[0], _Digits);
+
+   bool ok = false;
    if(sig.side > 0)
-   {
-      if(!trade.BuyLimit(lot, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0,
-                         "PPO Long " + _Symbol))
-         Print("BuyLimit failed: ", trade.ResultRetcodeDescription());
+     {
+      ok = trade.BuyLimit(lot, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0,
+                          "PPO Long " + _Symbol);
+      if(!ok)
+         Print("BuyLimit failed: ", trade.ResultRetcodeDescription(),
+               " price=", price, " ask=", ask, " sl=", sl, " tp=", tp);
       else
          Print("BuyLimit OK: lot=", lot, " price=", price,
                " sl=", sl, " tp=", tp, " regime=", sig.regime);
-   }
+     }
    else if(sig.side < 0)
-   {
-      if(!trade.SellLimit(lot, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0,
-                          "PPO Short " + _Symbol))
-         Print("SellLimit failed: ", trade.ResultRetcodeDescription());
+     {
+      ok = trade.SellLimit(lot, price, _Symbol, sl, tp, ORDER_TIME_GTC, 0,
+                           "PPO Short " + _Symbol);
+      if(!ok)
+         Print("SellLimit failed: ", trade.ResultRetcodeDescription(),
+               " price=", price, " bid=", bid, " sl=", sl, " tp=", tp);
       else
          Print("SellLimit OK: lot=", lot, " price=", price,
                " sl=", sl, " tp=", tp, " regime=", sig.regime);
+     }
+
+   //--- Register partial TP tracking for this order once it fills
+   //    We store the intended entry price and TP1 level now;
+   //    CheckPartialTP() will match by position ticket when filled.
+   if(ok && EnablePartialTP && g_partialTPCount < 99)
+   {
+      double atrBuf[];
+      double tp1 = 0;
+      if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuf) > 0)
+         tp1 = price + sig.side * PartialTPAtrMult * atrBuf[0];
+
+      g_partialTPs[g_partialTPCount].ticket      = 0;        // filled after order
+      g_partialTPs[g_partialTPCount].tp1Level     = NormalizeDouble(tp1, _Digits);
+      g_partialTPs[g_partialTPCount].entryPrice   = price;
+      g_partialTPs[g_partialTPCount].origLot      = lot;
+      g_partialTPs[g_partialTPCount].partialDone  = false;
+      g_partialTPs[g_partialTPCount].side         = sig.side;
+      g_partialTPCount++;
    }
 }
 
@@ -550,6 +662,91 @@ bool HasPosition(int side)
 }
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Check partial TP — close 50% at TP1, move SL to breakeven       |
+//| Called on every tick.                                             |
+//+------------------------------------------------------------------+
+void CheckPartialTP()
+{
+   double mid = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
+                 SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
+
+   //--- Match open positions to pending partial-TP records (by side)
+   for(int pi = 0; pi < g_partialTPCount; pi++)
+   {
+      if(g_partialTPs[pi].partialDone) continue;
+
+      //--- Find matching live position (link by side + symbol + magic)
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(!PositionSelectByTicket(ticket))            continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+
+         long posType = PositionGetInteger(POSITION_TYPE);
+         int  posSide = (posType == POSITION_TYPE_BUY) ? 1 : -1;
+         if(posSide != g_partialTPs[pi].side) continue;
+
+         //--- Store ticket if not yet linked
+         if(g_partialTPs[pi].ticket == 0)
+            g_partialTPs[pi].ticket = ticket;
+
+         //--- Check if TP1 hit
+         bool tp1Hit = (posSide > 0) ? (mid >= g_partialTPs[pi].tp1Level)
+                                     : (mid <= g_partialTPs[pi].tp1Level);
+         if(!tp1Hit) break;
+
+         //--- Close 50% of remaining lot
+         double curLot  = PositionGetDouble(POSITION_VOLUME);
+         double halfLot = NormalizeLot(curLot * 0.5);
+         if(halfLot < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+            halfLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+         if(halfLot >= curLot)
+         {
+            // Position too small to split — skip partial, let trailing handle it
+            g_partialTPs[pi].partialDone = true;
+            break;
+         }
+
+         bool closed = trade.PositionClosePartial(ticket, halfLot);
+         if(closed)
+         {
+            Print("PartialTP: closed ", halfLot, " lots at ", DoubleToString(mid, _Digits),
+                  " TP1=", DoubleToString(g_partialTPs[pi].tp1Level, _Digits));
+
+            //--- Move SL to breakeven for the remaining 50%
+            double be = NormalizeDouble(g_partialTPs[pi].entryPrice, _Digits);
+            double curTP = PositionGetDouble(POSITION_TP);
+            // Re-select because partial close may have refreshed the position
+            if(PositionSelectByTicket(ticket))
+            {
+               double newSL = be;
+               // Only tighten — never widen existing SL
+               double existSL = PositionGetDouble(POSITION_SL);
+               if(posSide > 0 && newSL > existSL)
+                  trade.PositionModify(ticket, newSL, curTP);
+               else if(posSide < 0 && (existSL <= 0 || newSL < existSL))
+                  trade.PositionModify(ticket, newSL, curTP);
+            }
+         }
+         g_partialTPs[pi].partialDone = true;
+         break;
+      }
+   }
+
+   //--- Compact: remove done records to prevent array overflow
+   int newCount = 0;
+   for(int pi = 0; pi < g_partialTPCount; pi++)
+   {
+      if(!g_partialTPs[pi].partialDone)
+         g_partialTPs[newCount++] = g_partialTPs[pi];
+   }
+   g_partialTPCount = newCount;
+}
+
+//+------------------------------------------------------------------+
 void CloseAll()
 {
    //--- Close positions
@@ -568,5 +765,136 @@ void CloseAll()
       if(OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
       trade.OrderDelete(ticket);
    }
+
+   //--- Clear partial TP state
+   g_partialTPCount = 0;
+}
+
+//+------------------------------------------------------------------+
+//|                  EA STATUS PANEL                                   |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Create/update a pixel-anchored label (right-upper corner)         |
+//+------------------------------------------------------------------+
+void _PanelText(const string name, const string text, int x, int y,
+                color clr, int sz = -1)
+{
+   string full = EA_PREFIX + name;
+   if(sz < 0) sz = PnlFontSz;
+
+   if(ObjectFind(0, full) < 0)
+      ObjectCreate(0, full, OBJ_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, full, OBJPROP_CORNER,    CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, full, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, full, OBJPROP_YDISTANCE, y);
+   ObjectSetString(0,  full, OBJPROP_TEXT,       text);
+   ObjectSetString(0,  full, OBJPROP_FONT,       PnlFontName);
+   ObjectSetInteger(0, full, OBJPROP_FONTSIZE,   sz);
+   ObjectSetInteger(0, full, OBJPROP_COLOR,      clr);
+   ObjectSetInteger(0, full, OBJPROP_SELECTABLE,  false);
+}
+
+//+------------------------------------------------------------------+
+//| Create/update background rectangle (right-upper)                  |
+//+------------------------------------------------------------------+
+void _PanelBg(int x, int y, int w, int h)
+{
+   string name = EA_PREFIX + "bg";
+   if(ObjectFind(0, name) < 0)
+      ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,        w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,        h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,      PnlClrBg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE,  BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,        clrDimGray);
+   ObjectSetInteger(0, name, OBJPROP_WIDTH,        1);
+   ObjectSetInteger(0, name, OBJPROP_BACK,         false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
+}
+
+//+------------------------------------------------------------------+
+//| Draw EA status panel                                              |
+//+------------------------------------------------------------------+
+void _DrawEAPanel()
+{
+   if(!ShowPanel) return;
+
+   int panelW = 280;
+   int panelH = 130;
+   int bx = PanelX + panelW;
+   int by = PanelY;
+
+   _PanelBg(bx, by, panelW, panelH);
+
+   int lh = 17;
+   int tx = bx - 10;
+   int vx = tx - 115;
+   int ty = by + 8;
+
+   //--- Title
+   string zmqBadge = g_zmqConnected ? " [ZMQ]" : " [FILE]";
+   _PanelText("title", "EA  " + _Symbol + zmqBadge, tx, ty, PnlClrTitle, PnlFontSz + 2);
+   ty += lh + 4;
+
+   //--- Divider
+   _PanelText("div1", "--------------------------------------", tx, ty, C'60,60,80', PnlFontSz - 2);
+   ty += lh;
+
+   //--- Position
+   string posStr = "FLAT";
+   color  posClr = clrWhite;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      long pt = PositionGetInteger(POSITION_TYPE);
+      if(pt == POSITION_TYPE_BUY)  { posStr = "LONG";  posClr = clrLimeGreen; }
+      else                          { posStr = "SHORT"; posClr = clrTomato;    }
+      break;
+   }
+   _PanelText("pos_lbl", "Position    :", tx, ty, PnlClrLabel);
+   _PanelText("pos_val", posStr,           vx, ty, posClr);
+   ty += lh;
+
+   //--- Drawdown
+   double dd = AccountDrawdownPct();
+   color  ddClr = (dd < 5) ? clrLimeGreen : (dd < 10) ? clrYellow : clrTomato;
+   _PanelText("dd_lbl", "Drawdown    :", tx, ty, PnlClrLabel);
+   _PanelText("dd_val", DoubleToString(dd, 2) + "%", vx, ty, ddClr);
+   ty += lh;
+
+   //--- Heartbeat
+   string hbStr = "---";
+   color  hbClr = clrGray;
+   if(g_zmqConnected && g_lastHeartbeat > 0)
+   {
+      int elapsed = (int)(TimeGMT() - g_lastHeartbeat);
+      hbStr = IntegerToString(elapsed) + "s ago";
+      hbClr = (elapsed <= HeartbeatMaxSec) ? clrLimeGreen : clrTomato;
+   }
+   _PanelText("hb_lbl", "Last HB     :", tx, ty, PnlClrLabel);
+   _PanelText("hb_val", hbStr,             vx, ty, hbClr);
+   ty += lh;
+
+   //--- EOD
+   _PanelText("eod_lbl", "EOD         :", tx, ty, PnlClrLabel);
+   _PanelText("eod_val", IntegerToString(EodHourGMT) + ":00 GMT", vx, ty, clrWhite);
+
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
+//| Remove all panel objects                                          |
+//+------------------------------------------------------------------+
+void _DeleteEAPanel()
+{
+   ObjectsDeleteAll(0, EA_PREFIX);
+   ChartRedraw(0);
 }
 //+------------------------------------------------------------------+

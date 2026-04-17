@@ -201,7 +201,9 @@ RL_N_STEPS = 2048
 RL_BATCH_SIZE = 64
 RL_TOTAL_TIMESTEPS = 500_000
 MAX_HOLD_BARS = 60
-FEATURE_DIM = 24
+FEATURE_DIM = 24        # price/market features from build_feature_matrix()
+POSITION_STATE_DIM = 3  # appended live: [position(-1/0/1), upnl_pct, bars_norm]
+OBS_DIM = FEATURE_DIM + POSITION_STATE_DIM  # total PPO observation size = 27
 ROLLING_WINDOW = 200
 
 # Feature engineering

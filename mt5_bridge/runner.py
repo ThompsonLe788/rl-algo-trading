@@ -496,6 +496,23 @@ class SymbolWorker(threading.Thread):
                 equity, balance = account_info()
                 now_utc = datetime.now(timezone.utc)
 
+                # ── Step 1: Sync live position state from MT5 ──────────────
+                # Python tracks fills independently of signal flow so that
+                # the PPO CLOSE action can be gated on a real open position.
+                _mt5_pos = mt5.positions_get(symbol=self.symbol)
+                if _mt5_pos:
+                    _p = _mt5_pos[0]
+                    current_mt5_position = 1 if _p.type == 0 else -1  # 0=BUY,1=SELL
+                    mt5_entry_price      = _p.price_open
+                    mt5_upnl             = _p.profit
+                    mt5_bars_in_trade    = max(1, int(
+                        (now_utc.timestamp() - _p.time) / 60))  # minutes
+                else:
+                    current_mt5_position = 0
+                    mt5_entry_price      = 0.0
+                    mt5_upnl             = 0.0
+                    mt5_bars_in_trade    = 0
+
                 # Heartbeat flush every tick — keeps dashboard/panel last_updated fresh
                 # even during EOD/news blocks when no signal is generated.
                 LiveStateWriter.instance().update_account(
@@ -621,11 +638,30 @@ class SymbolWorker(threading.Thread):
 
                 try:
                     import numpy as __np
+                    from config import OBS_DIM as _OBS_DIM, FEATURE_DIM as _FEAT_DIM
                     feats = _bfm(tick_df).fillna(0.0)
                     _row  = feats.iloc[-1].to_numpy(dtype=float, na_value=0.0)
-                    obs   = __np.where(__np.isfinite(_row), _row, 0.0).astype(__np.float32)
+                    price_obs = __np.where(__np.isfinite(_row), _row, 0.0).astype(__np.float32)
+
+                    # Append live position state (matches _build_obs in XauIntradayEnv)
+                    _atr = tick_atr if tick_atr > 0 else 1.0
+                    if current_mt5_position != 0 and mt5_entry_price > 0:
+                        _upnl_pct = float(__np.clip(
+                            current_mt5_position * (mid_price - mt5_entry_price) / _atr,
+                            -5.0, 5.0))
+                    else:
+                        _upnl_pct = 0.0
+                    from config import MAX_HOLD_BARS as _MHB
+                    _bars_norm = float(__np.clip(mt5_bars_in_trade / max(_MHB, 1), 0.0, 1.0))
+                    pos_state = __np.array(
+                        [float(current_mt5_position), _upnl_pct, _bars_norm],
+                        dtype=__np.float32)
+
+                    # Use augmented obs if model expects OBS_DIM, else price_obs only
                     if model_ref._model is not _live_model:
                         _live_model = model_ref._model
+                    _exp_dim = _live_model.observation_space.shape[0]
+                    obs = __np.concatenate([price_obs, pos_state]) if _exp_dim > _FEAT_DIM else price_obs
                     action, _ = _live_model.predict(obs, deterministic=True)
                 except Exception as exc:
                     logger.error(f"[{self.symbol}] Inference error: {exc}")
@@ -638,6 +674,13 @@ class SymbolWorker(threading.Thread):
                 win_prob    = float(kelly.win_rate)
                 tp_mult     = sl_tp_opt.get_tp_mult(_regime, now_utc.hour)
                 tp_dist     = tick_atr * tp_mult
+
+                # ── Step 2: Gate CLOSE on confirmed MT5 position ───────────
+                # PPO fires action=3 (CLOSE) even when flat because position
+                # state is missing from obs. Only forward CLOSE when MT5
+                # confirms an open position — prevents phantom closes.
+                if action_name == "CLOSE" and current_mt5_position == 0:
+                    action_name = "HOLD"
 
                 _send(zmq_socket, self.symbol, action_name, price, final_lot,
                       "", self.__class__._zmq_send_lock,
@@ -742,12 +785,11 @@ def _send(sock, symbol: str, action: str, price: float, lot: float,
           reason: str, lock: threading.Lock,
           sl_dist: float = 0.0, tp_dist: float = 0.0) -> None:
     import zmq
-    # Python only places entries — exits are managed by EA (SL/TP/EOD/partial TP).
-    # HOLD: nothing to do.
-    # CLOSE: EA handles all exits; Python must not interfere.
-    if action in ("HOLD", "CLOSE"):
+    # HOLD: no action needed.
+    # CLOSE is allowed through — gated upstream (only sent when MT5 confirms open position).
+    if action == "HOLD":
         return
-    _side_map = {"LONG": 1, "SHORT": -1}
+    _side_map = {"LONG": 1, "SHORT": -1, "CLOSE": 0}
     payload = json.dumps({
         "symbol": symbol, "action": action,
         "side": _side_map.get(action, 0),

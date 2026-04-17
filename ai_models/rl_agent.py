@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     SPREAD_BPS, EOD_HOUR_GMT, MAX_HOLD_BARS,
     RL_LEARNING_RATE, RL_N_STEPS, RL_BATCH_SIZE,
-    RL_TOTAL_TIMESTEPS, FEATURE_DIM, MODEL_DIR,
+    RL_TOTAL_TIMESTEPS, FEATURE_DIM, OBS_DIM, MODEL_DIR,
 )
 from ai_models.features import build_feature_matrix
 
@@ -99,8 +99,10 @@ class ATSIntradayEnv(gym.Env):
         self.atr_trail_mult = atr_trail_mult if atr_trail_mult is not None else self.ATR_TRAIL_MULT
 
         self.action_space = spaces.Discrete(4)
+        # OBS_DIM = FEATURE_DIM(24) + POSITION_STATE_DIM(3)
+        # Extra dims: [position(-1/0/1), unrealized_pnl_pct, bars_in_trade_norm]
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(FEATURE_DIM,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32
         )
 
         # Precompute features
@@ -121,6 +123,33 @@ class ATSIntradayEnv(gym.Env):
 
         # MAE tracking (Maximum Adverse Excursion)
         self._mae_worst: float = 0.0  # worst adverse price move since entry
+
+    def _build_obs(self, idx: int) -> np.ndarray:
+        """Concatenate market features with live position state.
+
+        Extra dims appended to the 24-dim price vector:
+          [0] position        : -1 / 0 / +1
+          [1] unrealized_pnl  : (mid - entry) / atr, clipped ±5
+          [2] bars_in_trade   : hold_bars / MAX_HOLD_BARS, clipped 0-1
+        Model learns to CLOSE when upnl deteriorates and to hold winners.
+        """
+        price_obs = self.features[min(idx, len(self.features) - 1)]
+        price_obs = np.nan_to_num(price_obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mid = self._get_mid(min(idx, len(self.df) - 1))
+        atr = self._get_atr(min(idx, len(self.df) - 1))
+
+        if self.position != 0 and self.entry_price > 0 and atr > 0:
+            upnl_pct = float(np.clip(
+                self.position * (mid - self.entry_price) / atr, -5.0, 5.0))
+        else:
+            upnl_pct = 0.0
+
+        bars_norm = float(np.clip(self.hold_bars / max(MAX_HOLD_BARS, 1), 0.0, 1.0))
+
+        pos_state = np.array([float(self.position), upnl_pct, bars_norm],
+                             dtype=np.float32)
+        return np.concatenate([price_obs, pos_state])
 
     def _get_mid(self, idx):
         row = self.df.iloc[idx]
@@ -258,9 +287,7 @@ class ATSIntradayEnv(gym.Env):
         self.trade_count = 0
         self.trail_level = 0.0
         self._mae_worst = 0.0
-        obs = self.features[self.i]
-        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-        return obs, {}
+        return self._build_obs(self.i), {}
 
     def step(self, action: int):
         # Force close at EOD
@@ -302,10 +329,7 @@ class ATSIntradayEnv(gym.Env):
         done = self._done()
         truncated = False
 
-        obs = self.features[min(self.i, len(self.features) - 1)]
-        obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return obs, float(reward), done, truncated, {
+        return self._build_obs(self.i), float(reward), done, truncated, {
             "pnl": pnl,
             "position": self.position,
             "trade_count": self.trade_count,
